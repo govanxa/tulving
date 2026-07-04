@@ -19,6 +19,11 @@ EXPECTED_EXPORTS = {
     "MemoryEntry",
     "Relationship",
     "SourceInfo",
+    # embedding adapters (heavy deps gated inside constructors — import is safe)
+    "EmbeddingAdapter",
+    "HashEmbedder",
+    "LocalEmbedder",
+    "OpenAIEmbedder",
     # exceptions (full D6 hierarchy)
     "ConfigError",
     "MemoryStoreError",

@@ -9,6 +9,12 @@ This is a name-holding pre-release (0.0.1). The v0.1 implementation is in
 active development.
 """
 
+from tulving.adapters.embeddings import (
+    EmbeddingAdapter,
+    HashEmbedder,
+    LocalEmbedder,
+    OpenAIEmbedder,
+)
 from tulving.entry import MemoryEntry, Relationship, SourceInfo
 from tulving.enums import ArchiveReason, MatchType, MemoryType, SessionStatus
 from tulving.exceptions import (
@@ -26,10 +32,14 @@ __version__ = "0.0.1"
 __all__ = [
     "ArchiveReason",
     "ConfigError",
+    "EmbeddingAdapter",
+    "HashEmbedder",
+    "LocalEmbedder",
     "MatchType",
     "MemoryEntry",
     "MemoryStoreError",
     "MemoryType",
+    "OpenAIEmbedder",
     "Relationship",
     "ScopeError",
     "SecurityError",
