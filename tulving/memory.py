@@ -70,6 +70,7 @@ from tulving.exceptions import (
     TulvingError,
     VectorIndexError,
 )
+from tulving.export import ImportReport, MemoryExporter, MemoryImporter
 from tulving.kv_index import KVIndex
 from tulving.security import compile_key_patterns, contain_path, redact_text
 from tulving.semantic_index import ReconcileReport, SemanticIndex
@@ -650,6 +651,9 @@ class Memory:
             # Consumed by the MemorySummarizer (summarize() + end-of-session
             # rollups). None degrades loudly there — never called elsewhere.
             self._llm = llm_adapter
+            # Retained for the JSON import path (re-embedding); None imports
+            # without vectors (build step 15). The semantic index also holds it.
+            self._embedding_adapter = embedding_adapter
 
             self._store = MemoryStore(self._backend, clock=clock)
             self._kv = KVIndex(self._store)
@@ -1554,6 +1558,85 @@ class Memory:
         self._require_writable()
         summarizer = self._summarizer if self._summarizer is not None else self._get_summarizer()
         return summarizer.summarize(older_than=older_than, tags=tags)
+
+    # --------------------------------------------------------------- export/import
+
+    def export_json(
+        self,
+        path: str | Path,
+        *,
+        include_embeddings: bool = False,
+        include_archived: bool = False,
+        include_sensitive: bool = False,
+        allowed_root: str | Path | None = None,
+    ) -> None:
+        """Export this store to a JSON file (build step 15; thin convenience).
+
+        Assembles a :class:`MemoryExporter` over this handle's store, compiled
+        sensitive-key patterns (so the user's ``sensitive_keys`` reach the
+        export surface — security req #1), and containment root (default: the
+        memory directory). Redaction is ON unless ``include_sensitive=True``.
+
+        Args:
+            path: Destination path (leaf-validated, directory-contained).
+            include_embeddings: Emit per-entry vectors from the BLOBs.
+            include_archived: Include archived entries (lossless chains).
+            include_sensitive: Opt OUT of redaction (plaintext backup).
+            allowed_root: Containment root; defaults to the memory directory.
+
+        Raises:
+            SecurityError: On a path violation.
+            StorageError: On serialization or I/O failure.
+        """
+        self._ensure_started()
+        exporter = MemoryExporter(
+            self._store,
+            allowed_root=allowed_root if allowed_root is not None else self._memory_dir,
+            sensitive_key_patterns=self._key_patterns,
+        )
+        exporter.to_json(
+            path,
+            include_embeddings=include_embeddings,
+            include_archived=include_archived,
+            include_sensitive=include_sensitive,
+        )
+
+    def import_json(self, path: str | Path, *, on_key_conflict: str = "skip") -> ImportReport:
+        """Import a JSON export into this store (build step 15; thin convenience).
+
+        Assembles a :class:`MemoryImporter` over this handle's store and active
+        embedding adapter, runs the import, then best-effort reconciles the
+        semantic index so imported vectors (persisted as BLOBs by ``restore``)
+        become searchable in this session — a cache failure is logged, never
+        fatal (ADR-015; the BLOBs remain the source of truth).
+
+        Args:
+            path: Source export file (read-only; deliberately not contained).
+            on_key_conflict: ``"skip"`` (default) or ``"supersede"`` (D1).
+
+        Returns:
+            The :class:`ImportReport`.
+
+        Raises:
+            MemoryStoreError: On a read-only handle or a malformed/incompatible
+                file.
+            StorageError: On I/O or embedding failure.
+            ValueError: On an unknown ``on_key_conflict``.
+        """
+        self._ensure_started()
+        self._require_writable()
+        importer = MemoryImporter(self._store, embedder=self._embedding_adapter)
+        report = importer.from_json(path, on_key_conflict=on_key_conflict)
+        if report.entries_imported and self._semantic is not None and self._semantic_open:
+            try:
+                self._semantic.reconcile()
+            except VectorIndexError as exc:
+                logger.warning(
+                    "post-import index reconcile failed: %s — imported vectors are "
+                    "durable BLOBs; run rebuild_index() to make them searchable",
+                    exc,
+                )
+        return report
 
     # --------------------------------------------------------------- internals
 

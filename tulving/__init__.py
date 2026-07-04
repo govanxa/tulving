@@ -29,6 +29,7 @@ from tulving.exceptions import (
     TulvingError,
     VectorIndexError,
 )
+from tulving.export import ImportReport, MemoryExporter, MemoryImporter
 from tulving.memory import Memory, SearchResult, StartupReport
 
 __version__ = "0.0.1"
@@ -39,11 +40,14 @@ __all__ = [
     "CuratedContext",
     "EmbeddingAdapter",
     "HashEmbedder",
+    "ImportReport",
     "LifecycleConfig",
     "LocalEmbedder",
     "MatchType",
     "Memory",
     "MemoryEntry",
+    "MemoryExporter",
+    "MemoryImporter",
     "MemoryStoreError",
     "MemoryType",
     "OpenAIEmbedder",

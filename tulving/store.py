@@ -16,12 +16,14 @@ per entry.py's documented contract.
 from __future__ import annotations
 
 import json
+import threading
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import AbstractContextManager, contextmanager
 from datetime import datetime, timedelta
 from typing import Any, Final
 
-from tulving.adapters.storage import StorageBackend
+from tulving.adapters.storage import StorageBackend, pack_embedding, unpack_embedding
 from tulving.entry import MemoryEntry, Relationship, SourceInfo, utcnow
 from tulving.enums import ArchiveReason, MemoryType
 from tulving.exceptions import MemoryStoreError, StorageError
@@ -73,6 +75,10 @@ class MemoryStore:
         """
         self._backend = backend
         self._clock: Callable[[], datetime] = clock if clock is not None else utcnow
+        # Per-thread "am I inside store.transaction()?" flag so restore() can
+        # self-wrap its supersede path atomically when called standalone
+        # without double-BEGIN under an ambient transaction (C4).
+        self._txn_state = threading.local()
 
     # ----------------------------------------------------------------- create
 
@@ -251,6 +257,139 @@ class MemoryStore:
                     Relationship(target_id=old["id"], relationship_type="supersedes")
                 )
         self._backend.create(entry.to_dict(), embedding=embedding)
+
+    # ----------------------------------------------------------- import seams
+
+    def mint_id(self) -> str:
+        """Mint a fresh entry id using the same seam ``create()`` uses.
+
+        Exposed so the importer can pre-mint the whole-file id map (references
+        must be remapped before any row is written) with ids that are
+        format-identical to natively created ones (uuid4 hex).
+        """
+        return uuid.uuid4().hex
+
+    def get_meta(self) -> dict[str, Any]:
+        """The identity/meta row (D3): schema_version + embedding identity.
+
+        Passthrough to the backend so the exporter can stamp the envelope and
+        the importer can decide vector reuse vs re-embed without reaching
+        through to the backend.
+        """
+        return self._backend.get_meta()
+
+    def get_embedding(self, entry_id: str) -> list[float] | None:
+        """Unpack the embedding BLOB (ADR-015 source of truth) to floats.
+
+        Reads the opaque bytes the store persisted and applies the exact
+        inverse of the pack used on write. Returns None when the entry has no
+        embedding.
+
+        Raises:
+            StorageError: On a missing id (propagated from the backend) or a
+                corrupt BLOB.
+        """
+        blob = self._backend.get_embedding(entry_id)
+        return None if blob is None else unpack_embedding(blob)
+
+    def transaction(self) -> AbstractContextManager[None]:
+        """Explicit all-or-nothing scope over multiple ``restore()`` calls.
+
+        Wraps the backend transaction and marks this thread as "in a store
+        transaction" so ``restore()`` skips its own self-wrap (no double-BEGIN)
+        and every nested restore shares the one atomic scope — a mid-import
+        failure rolls back every row (import atomicity).
+        """
+        return self._transaction_scope()
+
+    @contextmanager
+    def _transaction_scope(self) -> Iterator[None]:
+        """Backend transaction + a per-thread in-transaction marker."""
+        with self._backend.transaction():
+            previous = getattr(self._txn_state, "active", False)
+            self._txn_state.active = True
+            try:
+                yield
+            finally:
+                self._txn_state.active = previous
+
+    def restore(
+        self,
+        entry: MemoryEntry,
+        *,
+        embedding: list[float] | None = None,
+        supersede_live_key: bool = False,
+    ) -> MemoryEntry:
+        """Persist an entry VERBATIM (the import path) — no minting, no restamp.
+
+        Unlike ``create()``, ``restore()`` keeps the given ``id``, timestamps,
+        ``access_count``, archived state, ``archive_reason``, and ``pinned``
+        exactly — the caller (importer) has already minted the id and remapped
+        references. The embedding is packed and written as the row's BLOB
+        (ADR-015 source of truth). A LIVE keyed row lands in the KV index by
+        construction (the partial unique key column IS the index); the semantic
+        index is NOT touched here — the store is deliberately index-agnostic,
+        and ``memory.py`` reconciles vectors from the persisted BLOBs.
+
+        Multi-write atomicity (the supersede path) is guaranteed either way:
+        under an ambient ``store.transaction()`` (the importer's batch) all
+        restores share one atomic scope; called standalone, restore self-wraps
+        the archive+insert pair in its own backend transaction so a failed
+        insert never leaves the live holder archived-then-orphaned (C4).
+
+        On a LIVE-key collision:
+            ``supersede_live_key=True`` applies D1 — archive the live holder
+            ``SUPERSEDED`` and append a ``supersedes`` back-link to ``entry``.
+            ``supersede_live_key=False`` raises ``MemoryStoreError`` (a race
+            guard; the importer pre-checks via ``exists()``).
+
+        Archived imported entries never trigger supersede logic: the partial
+        unique index lets any number of archived rows share a key.
+
+        Args:
+            entry: The fully-formed entry to persist verbatim.
+            embedding: The vector to store as the BLOB, or None.
+            supersede_live_key: Whether a live-key collision supersedes.
+
+        Returns:
+            ``entry`` (carrying the appended supersede back-link, if any).
+
+        Raises:
+            MemoryStoreError: Live-key collision without ``supersede_live_key``.
+            StorageError: Propagated backend failure.
+        """
+        packed = pack_embedding(embedding) if embedding is not None else None
+        if getattr(self._txn_state, "active", False):
+            self._restore_write(entry, packed, supersede_live_key=supersede_live_key)
+        else:
+            with self._backend.transaction():
+                self._restore_write(entry, packed, supersede_live_key=supersede_live_key)
+        return entry
+
+    def _restore_write(
+        self, entry: MemoryEntry, packed: bytes | None, *, supersede_live_key: bool
+    ) -> None:
+        """The verbatim persist + D1 supersede; MUST run inside an atomic scope."""
+        if entry.key is not None and not entry.archived:
+            old = self._backend.get_by_key(entry.key)  # active rows only
+            if old is not None:
+                if not supersede_live_key:
+                    raise MemoryStoreError(
+                        f"key {entry.key!r} is held by an active entry; restore requires "
+                        "supersede_live_key=True to supersede it"
+                    )
+                self._backend.update(
+                    old["id"],
+                    {
+                        "archived": True,
+                        "archive_reason": ArchiveReason.SUPERSEDED.value,
+                        "updated_at": self._clock().isoformat(),
+                    },
+                )
+                entry.relationships.append(
+                    Relationship(target_id=old["id"], relationship_type="supersedes")
+                )
+        self._backend.create(entry.to_dict(), embedding=packed)
 
     # ------------------------------------------------------------------- read
 
