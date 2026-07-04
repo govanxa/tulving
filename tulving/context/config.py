@@ -9,8 +9,8 @@ blueprint sanctions creation "at whichever build step needs it first").
 As-built divergences from blueprint-lifecycle (see the "As-built note from
 build step 9" appended to that blueprint — reconcile before implementing
 step 13): ``startup_deadline_seconds`` lives on the ``Memory`` constructor
-(default 10.0), not here; ``activity_debounce_seconds`` is omitted until
-step 13 implements activity debouncing.
+(default 10.0), not here; ``activity_debounce_seconds`` was added at step 13
+together with ``record_activity`` debouncing, as that note prescribed.
 """
 
 from __future__ import annotations
@@ -55,6 +55,10 @@ class LifecycleConfig:
     preserve_decisions_verbatim: bool = True
     llm_call_budget: int = 10  # per summarize pass (adapters-llm §2.1)
     max_input_tokens: int = 4000  # per LLM call, pre-margin
+    activity_debounce_seconds: float = 60.0
+    # ^ read-path (search/curate) activity-write throttle used by
+    #   record_activity(write=False); added at build step 13 per the as-built
+    #   note in blueprint-lifecycle. store() activity is never debounced.
 
     def __post_init__(self) -> None:
         """Merge half-life overrides onto defaults, then validate.
@@ -104,3 +108,21 @@ class LifecycleConfig:
             raise ConfigError(f"llm_call_budget must be >= 1, got {self.llm_call_budget!r}")
         if self.max_input_tokens < 256:
             raise ConfigError(f"max_input_tokens must be >= 256, got {self.max_input_tokens!r}")
+        debounce = self.activity_debounce_seconds
+        if (
+            isinstance(debounce, bool)
+            or not isinstance(debounce, int | float)
+            or math.isnan(debounce)
+            or math.isinf(debounce)
+            or debounce < 0
+        ):
+            raise ConfigError(
+                f"activity_debounce_seconds must be a finite number >= 0, got {debounce!r}"
+            )
+        if debounce >= self.inactivity_threshold.total_seconds():
+            raise ConfigError(
+                f"activity_debounce_seconds ({debounce!r}) must be smaller than "
+                f"inactivity_threshold ({self.inactivity_threshold!r}): a debounce at or "
+                "past the abandonment threshold guarantees a read-only live session is "
+                "falsely abandoned"
+            )

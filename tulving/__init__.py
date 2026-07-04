@@ -16,6 +16,7 @@ from tulving.adapters.embeddings import (
     OpenAIEmbedder,
 )
 from tulving.context.config import LifecycleConfig
+from tulving.context.lifecycle import Session, SessionSummary
 from tulving.entry import MemoryEntry, Relationship, SourceInfo
 from tulving.enums import ArchiveReason, MatchType, MemoryType, SessionStatus
 from tulving.exceptions import (
@@ -48,7 +49,9 @@ __all__ = [
     "ScopeError",
     "SearchResult",
     "SecurityError",
+    "Session",
     "SessionStatus",
+    "SessionSummary",
     "SourceInfo",
     "StartupReport",
     "StorageError",

@@ -19,7 +19,7 @@ import json
 import uuid
 from collections.abc import Callable, Sequence
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Final
 
 from tulving.adapters.storage import StorageBackend
 from tulving.entry import MemoryEntry, Relationship, SourceInfo, utcnow
@@ -44,6 +44,15 @@ _DEFAULT_PURGE_REASONS: tuple[ArchiveReason, ...] = (
     ArchiveReason.FORGOTTEN,
     ArchiveReason.ABANDONED,
 )
+
+# Reserved lifecycle namespace (SEC-SEV-001): the public create paths refuse
+# these keys so a caller can never squat — or, worse, D1-supersede — a genuine
+# session marker after the session ends. Deliberately duplicates
+# tulving.context.lifecycle.SESSION_KEY_PREFIX as a literal: the store sits
+# BELOW lifecycle in the layer order and must not import it (tests pin the two
+# constants together). Lifecycle writes markers through the backend directly,
+# so this boundary never blocks the genuine writer.
+_RESERVED_SESSION_KEY_PREFIX: Final[str] = "session:"
 
 
 class MemoryStore:
@@ -97,7 +106,9 @@ class MemoryStore:
             type: The memory type; ``SUMMARY`` is rejected unless
                 ``_allow_summary`` (summarizer only).
             source: Provenance; ``agent_id`` must be non-empty (D7).
-            key: Optional address; ``""`` is a caller bug (use None).
+            key: Optional address; ``""`` is a caller bug (use None); the
+                ``session:`` prefix is reserved for lifecycle markers and
+                refused (SEC-SEV-001).
             tags: Deduped preserving order; each must be a non-empty str.
             base_importance: Persisted once, immutable afterwards (D2).
             relationships: Stored verbatim; metadata must be JSON-safe.
@@ -191,6 +202,11 @@ class MemoryStore:
             raise MemoryStoreError("summaries must carry non-empty _source_entry_ids back-links")
         if key == "":
             raise MemoryStoreError("key must be None (unkeyed) or a non-empty string")
+        if key is not None and key.startswith(_RESERVED_SESSION_KEY_PREFIX):
+            raise MemoryStoreError(
+                f"keys beginning with {_RESERVED_SESSION_KEY_PREFIX!r} are reserved for "
+                "system session markers and cannot be stored by callers (SEC-SEV-001)"
+            )
         clean_tags = _validated_tags(tags)
         clean_relationships = list(relationships) if relationships is not None else []
         _require_json_relationships(clean_relationships)
