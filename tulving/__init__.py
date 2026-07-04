@@ -9,4 +9,34 @@ This is a name-holding pre-release (0.0.1). The v0.1 implementation is in
 active development.
 """
 
+from tulving.entry import MemoryEntry, Relationship, SourceInfo
+from tulving.enums import ArchiveReason, MatchType, MemoryType, SessionStatus
+from tulving.exceptions import (
+    ConfigError,
+    MemoryStoreError,
+    ScopeError,
+    SecurityError,
+    StorageError,
+    TulvingError,
+    VectorIndexError,
+)
+
 __version__ = "0.0.1"
+
+__all__ = [
+    "ArchiveReason",
+    "ConfigError",
+    "MatchType",
+    "MemoryEntry",
+    "MemoryStoreError",
+    "MemoryType",
+    "Relationship",
+    "ScopeError",
+    "SecurityError",
+    "SessionStatus",
+    "SourceInfo",
+    "StorageError",
+    "TulvingError",
+    "VectorIndexError",
+    "__version__",
+]
