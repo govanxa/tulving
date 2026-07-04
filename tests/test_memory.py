@@ -166,6 +166,9 @@ class StubLifecycle:
         if self.close_raises:
             raise RuntimeError("lifecycle close exploded")
 
+    def record_activity(self, session_id: str, *, write: bool = True) -> None:
+        self.calls.append(f"record_activity:{session_id}:{write}")
+
 
 class FakeCurator:
     """Records delegation; stands in for ContextCurator (build step 10)."""
@@ -679,7 +682,11 @@ class TestStartup:
         try:
             report = handle.startup()
             assert report.decay is not None
-            assert report.decay.entries_evicted == 0
+            # The only non-exempt active row is the session marker that
+            # seeder.close() persisted (SUMMARY, importance 0.7, 30-day
+            # half-life): decayed below the floor, it is the sole eviction.
+            # The pinned FACT and the DECISION are exempt and survive.
+            assert report.decay.entries_evicted == 1
             assert report.decay.entries_exempted == 2
             for entry_id in (decision.id, pinned.id):
                 entry = handle.get_by_id(entry_id)
@@ -1188,9 +1195,23 @@ class TestSessions:
             agent_a.close()
             agent_b.close()
 
-    def test_summarize_seam(self, memory: Memory) -> None:
-        with pytest.raises(NotImplementedError, match=r"[Ss]ummarizer"):
-            memory.summarize()
+    def test_summarize_llm_none_degrades_loudly(
+        self, memory: Memory, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # The step-12 seam is gone: the real MemorySummarizer is wired. With
+        # llm=None it degrades LOUDLY (warning + one visible fallback digest),
+        # never raising NotImplementedError, never silent.
+        store_fact(memory, "old fact worth rolling up")
+        with caplog.at_level(logging.WARNING, logger="tulving.summarizer"):
+            result = memory.summarize()
+        assert any("no LLM adapter" in rec.message for rec in caplog.records)
+        assert len(result) == 1
+        assert result[0].type is MemoryType.OBSERVATION  # skip-digest, not SUMMARY
+        assert "summarize_skipped" in result[0].tags
+
+    def test_summarize_llm_none_empty_store_returns_nothing(self, memory: Memory) -> None:
+        # No candidates => nothing stored, nothing returned (still no raise).
+        assert memory.summarize() == []
 
 
 class TestClose:
@@ -1387,7 +1408,10 @@ class TestRealSemanticIntegration:
             assert second.search("mismatch survivor") == []  # semantic disabled
             second.rebuild_index(re_embed=True)
             hits = second.search("mismatch survivor")
-            assert [r.entry.id for r in hits] == [entry.id]
+            # re_embed=True re-embeds every active entry, including the session
+            # marker that first.close() persisted (a real SUMMARY row) — so the
+            # survivor is FOUND among the hits, not necessarily the sole hit.
+            assert entry.id in {r.entry.id for r in hits}
         finally:
             second.close()
 
@@ -1661,6 +1685,228 @@ class TestSummarizerSeam:
             assert summarizer.calls == [(timedelta(days=1), ["t"])]
         finally:
             handle.close()
+
+    def test_summarize_uses_default_real_summarizer_with_llm(
+        self, tmp_path: Path, fake_clock: FakeClock
+    ) -> None:
+        # No injected summarizer: Memory builds a real MemorySummarizer over
+        # self._llm and delegates to it (SUMMARY digests, sources archived).
+        class FakeLLM:
+            max_input_tokens = 4000
+
+            def complete(self, prompt: str, **kwargs: Any) -> str:
+                return "digest of the two facts"
+
+        handle = make_memory(tmp_path, fake_clock, llm_adapter=FakeLLM())
+        try:
+            first = store_fact(handle, "fact one to summarize")
+            second = store_fact(handle, "fact two to summarize")
+            result = handle.summarize()
+            assert len(result) == 1
+            assert result[0].type is MemoryType.SUMMARY
+            assert result[0].content == "digest of the two facts"
+            # Sources archived SUMMARIZED (back-links) — loud, recoverable.
+            for src in (first, second):
+                archived = handle.get_by_id(src.id)
+                assert archived is not None and archived.archived is True
+                assert archived.archive_reason is ArchiveReason.SUMMARIZED
+        finally:
+            handle.close()
+
+    def test_end_of_session_rollup_delegates_to_default_summarizer(
+        self, tmp_path: Path, fake_clock: FakeClock
+    ) -> None:
+        # Behavior (not just execution) of _LifecycleSummarizerAdapter: with an
+        # LLM wired, ending a session rolls up THAT session's live entries via
+        # the default MemorySummarizer (session_id-scoped) — proving the adapter
+        # delegates to _get_summarizer().summarize(session_id=...). llm=None
+        # would wire summarizer=None and degrade loudly instead (covered by the
+        # lifecycle warning path).
+        class FakeLLM:
+            max_input_tokens = 4000
+
+            def complete(self, prompt: str, **kwargs: Any) -> str:
+                return "end-of-session digest"
+
+        handle = make_memory(tmp_path, fake_clock, llm_adapter=FakeLLM())
+        try:
+            with handle.session():
+                first = store_fact(handle, "session fact one")
+                second = store_fact(handle, "session fact two")
+            # Session exit -> LifecycleManager.end_session -> adapter -> real
+            # summarizer scoped to this session: both facts archived SUMMARIZED.
+            for src in (first, second):
+                archived = handle.get_by_id(src.id)
+                assert archived is not None and archived.archived is True
+                assert archived.archive_reason is ArchiveReason.SUMMARIZED
+        finally:
+            handle.close()
+
+    def test_summarizer_and_curator_share_one_estimator(self, memory: Memory) -> None:
+        # One resolved token estimator serves the whole handle: the default
+        # summarizer and the default curator receive the SAME instance.
+        curator = memory._get_curator()
+        summarizer = memory._get_summarizer()
+        shared = memory._get_estimator()
+        assert shared is curator._preferred_estimator
+        assert shared is summarizer._estimator
+
+    def test_shared_estimator_holds_under_concurrent_first_access(
+        self, tmp_path: Path, fake_clock: FakeClock
+    ) -> None:
+        # ADR-015 (one process, many threads): concurrent FIRST curate() and
+        # summarize() must not double-build and hand the curator and summarizer
+        # DIFFERENT estimators. Double-checked locking under _build_lock keeps
+        # exactly one estimator identity for the handle.
+        handle = make_memory(tmp_path, fake_clock)
+        try:
+            handle.startup()  # isolate the builder race from the startup race
+            barrier = threading.Barrier(8)
+            errors: list[Exception] = []
+
+            def run(i: int) -> None:
+                barrier.wait()
+                try:
+                    if i % 2 == 0:
+                        handle.curate("q")
+                    else:
+                        handle.summarize()
+                except Exception as exc:  # pragma: no cover - failure diagnostics
+                    errors.append(exc)
+
+            threads = [threading.Thread(target=run, args=(i,)) for i in range(8)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            assert errors == []
+            shared = handle._get_estimator()
+            assert handle._get_curator()._preferred_estimator is shared
+            assert handle._get_summarizer()._estimator is shared
+        finally:
+            handle.close()
+
+
+class TestReadActivity:
+    """search()/curate() bump the ACTIVE session (write=False) so a read-heavy
+    live session never looks abandoned — without write-amplifying (debounce)
+    and without ever touching another agent's session (SEC-SEV-002)."""
+
+    def _active_sid(self, handle: Memory, agent_id: str = "agent-x") -> str:
+        return str(handle._backend.list_sessions(agent_id=agent_id, status="active")[0]["id"])
+
+    def test_search_bumps_active_session_activity(
+        self, memory: Memory, fake_clock: FakeClock
+    ) -> None:
+        store_fact(memory, "seed", key="seed")  # auto-starts a session
+        sid = self._active_sid(memory)
+        before = memory._backend.get_session(sid)["last_activity_at"]
+        fake_clock.advance(minutes=5)  # past the 60s debounce, within 30min threshold
+        memory.search("seed")
+        after = memory._backend.get_session(sid)["last_activity_at"]
+        assert after != before
+
+    def test_curate_bumps_active_session_activity(
+        self, memory: Memory, fake_clock: FakeClock
+    ) -> None:
+        store_fact(memory, "seed for curate")
+        sid = self._active_sid(memory)
+        before = memory._backend.get_session(sid)["last_activity_at"]
+        fake_clock.advance(minutes=5)
+        memory.curate("seed")
+        after = memory._backend.get_session(sid)["last_activity_at"]
+        assert after != before
+
+    def test_read_activity_is_debounced_within_window(
+        self, memory: Memory, fake_clock: FakeClock
+    ) -> None:
+        store_fact(memory, "seed debounce")
+        sid = self._active_sid(memory)
+        before = memory._backend.get_session(sid)["last_activity_at"]
+        fake_clock.advance(seconds=10)  # within the 60s debounce
+        memory.search("seed debounce")
+        after = memory._backend.get_session(sid)["last_activity_at"]
+        assert after == before  # read paths must not write-amplify
+
+    def test_pure_read_before_any_write_starts_no_session(self, memory: Memory) -> None:
+        assert memory.search("nothing here") == []
+        assert memory._backend.list_sessions(agent_id="agent-x", status="active") == []
+
+    def test_read_never_bumps_or_abandons_another_agents_session(
+        self, tmp_path: Path, fake_clock: FakeClock
+    ) -> None:
+        backend = InMemoryBackend()
+        agent_a = make_memory(tmp_path, fake_clock, storage_backend=backend, subdir="a")
+        agent_b = make_memory(
+            tmp_path, fake_clock, storage_backend=backend, subdir="b", agent_id="agent-y"
+        )
+        try:
+            store_fact(agent_b, "b work")  # b holds a live ACTIVE session
+            sid_b = self._active_sid(agent_b, "agent-y")
+            before_b = backend.get_session(sid_b)["last_activity_at"]
+            store_fact(agent_a, "a work")  # a holds its own session
+            fake_clock.advance(minutes=5)  # < 30min inactivity threshold
+            agent_a.search("a work")  # a's read bumps ONLY a's session
+            session_b = backend.get_session(sid_b)
+            assert session_b["last_activity_at"] == before_b  # untouched
+            assert session_b["status"] == SessionStatus.ACTIVE.value  # never abandoned
+        finally:
+            agent_a.close()
+            agent_b.close()
+
+    def test_read_only_handle_records_no_activity(
+        self, tmp_path: Path, fake_clock: FakeClock
+    ) -> None:
+        backend = InMemoryBackend()
+        writer = make_memory(tmp_path, fake_clock, storage_backend=backend)
+        store_fact(writer, "shared", key="shared")
+        reader = Memory(
+            path=str(tmp_path / "mem"),
+            agent_id="agent-x",
+            storage_backend=backend,
+            clock=fake_clock,
+            read_only=True,
+        )
+        try:
+            sid = self._active_sid(writer)
+            before = backend.get_session(sid)["last_activity_at"]
+            fake_clock.advance(minutes=5)
+            reader.search("shared")  # read-only: never writes, never bumps
+            assert backend.get_session(sid)["last_activity_at"] == before
+        finally:
+            reader.close()
+            writer.close()
+
+    def test_read_only_guard_pins_even_with_a_cached_active_session(
+        self, tmp_path: Path, fake_clock: FakeClock
+    ) -> None:
+        # Hardens the read_only early-return in _record_read_activity: with a
+        # non-None _active_session_id pointing at a REAL ACTIVE session owned by
+        # the reader's agent, the debounce/None guards can no longer mask the
+        # read_only guard — only the read_only guard stops the write. (In normal
+        # use a read-only handle never sets _active_session_id, but the guard is
+        # the load-bearing defense and must bite on its own.)
+        backend = InMemoryBackend()
+        writer = make_memory(tmp_path, fake_clock, storage_backend=backend)
+        store_fact(writer, "shared", key="shared")
+        reader = Memory(
+            path=str(tmp_path / "mem"),
+            agent_id="agent-x",  # same agent -> ownership guard would NOT block
+            storage_backend=backend,
+            clock=fake_clock,
+            read_only=True,
+        )
+        try:
+            sid = self._active_sid(writer)
+            reader.startup()
+            reader._active_session_id = sid  # force a cached ACTIVE session
+            before = backend.get_session(sid)["last_activity_at"]
+            fake_clock.advance(minutes=5)  # past debounce, within threshold
+            reader.search("shared")  # read_only guard is the ONLY thing stopping a write
+            assert backend.get_session(sid)["last_activity_at"] == before
+        finally:
+            reader.close()
+            writer.close()
 
 
 # ---------------------------------------------------------------------------
