@@ -13,6 +13,7 @@ measuring the value it adds over having no memory at all. For the API-level quic
    - [LM Studio + a local model](#4a-lm-studio--a-local-model)
    - [Claude Code](#4b-claude-code)
    - [MCP Inspector — tool reference](#4c-mcp-inspector--tool-reference)
+   - [Global vs. per-project memory, and tagging](#4d-global-vs-per-project-memory-and-tagging)
 5. [Verifying it behaves correctly](#5-verifying-it-behaves-correctly)
 6. [Measuring the value vs. no memory](#6-measuring-the-value-vs-no-memory)
 7. [Storage model & platform support](#7-storage-model--platform-support)
@@ -239,6 +240,108 @@ What each tool is for:
 - **`memory_forget`** — remove by exactly one of key / id / tags; archives by default,
   `hard:true` deletes.
 - **`memory_list_keys`** — enumerate keys, with an optional `prefix` filter.
+
+### 4d. Global vs. per-project memory, and tagging
+
+Tulving scopes memory **entirely by `--memory-path`** — that directory (one SQLite file + index)
+is the whole boundary. There is no built-in "project" concept: point two sessions at the *same*
+path and they share everything; point them at *different* paths and they are fully isolated.
+Note the single-writer rule: only one *writable* server may hold a given path at a time (a second
+is refused, or may open `--read-only`). Pick the model that fits how you work.
+
+**Option 1 — Per-project memory (isolated).** Each project has its own store, its own writer lock,
+and you can run many Claude Code instances in parallel. Cross-project facts must be stored in each
+project separately. Either commit a project `.mcp.json`:
+
+```json
+{ "mcpServers": { "tulving": { "command": "tulving-mcp",
+    "args": ["--memory-path", "./.tulving", "--embedding", "local"] } } }
+```
+
+…or install once at user scope with a **relative** path (it resolves against each project's
+directory, so every project gets its own `./.tulving`):
+
+```bash
+claude mcp add --scope user tulving -- tulving-mcp --memory-path ./.tulving --embedding local
+```
+
+Add `./.tulving` to `.gitignore` unless you actually want to commit a project's memory.
+
+**Option 2 — One global brain (shared across every project).** Install at user scope with a single
+**absolute** path; every project reads and writes the same store:
+
+```bash
+claude mcp add --scope user tulving -- \
+  tulving-mcp --memory-path /home/you/.tulving/global --embedding local
+```
+
+Trade-off: because of the single-writer rule, only **one** Claude Code instance can use it at a
+time. That rules this out if you routinely run several sessions at once.
+
+**Option 3 — Hybrid: per-project writable + a shared read-only knowledge base (recommended if you
+run multiple instances).** This removes the "I have to repeat cross-project facts" downside without
+the single-writer limitation. Register **two** servers — a per-project writable one, and a shared
+one opened `--read-only` (read-only handles open concurrently, so all your parallel sessions can
+read it at the same time):
+
+```bash
+# per-project, writable — isolated, one lock each, safe to run in parallel
+claude mcp add --scope user tulving -- \
+  tulving-mcp --memory-path ./.tulving --embedding local
+
+# shared, READ-ONLY — universal knowledge every session can read at once
+claude mcp add --scope user tulving-shared -- \
+  tulving-mcp --memory-path /home/you/.tulving/global --embedding local --read-only
+```
+
+In a session the tools appear as `tulving:memory_*` (your project) and `tulving-shared:memory_*`
+(the global knowledge base). You **write** to the global store from one dedicated session — run a
+*writable* server on `/home/you/.tulving/global` in a single "notes" project, or populate it with a
+short Python script — and every other project reads it. `tulving-shared`'s `store`/`forget` tools
+return an error, which is the read-only guarantee working as intended.
+
+#### Tagging & key prefixes — organizing within a store
+
+Tags and key-prefixes are how you structure a store and filter recall — essential for a shared
+store, useful anywhere. **All tag filters are *any-of*:** an entry matches if it carries **at least
+one** of the listed tags (and `exclude_tags` always wins).
+
+**Add tags when storing** (the model does this via the MCP tool; you can do it directly in Python):
+
+```jsonc
+// MCP: memory_store arguments
+{ "content": "Chose JWT (RS256) for auth.", "type": "decision",
+  "key": "projA:decision:auth", "tags": ["projA", "auth"] }
+```
+```python
+# Python
+memory.store("Chose JWT (RS256) for auth.", type=MemoryType.DECISION,
+             key="projA:decision:auth", tags=["projA", "auth"])
+```
+
+**Filter by tags / prefix when recalling:**
+
+```jsonc
+{ "query": "auth", "tags": ["projA"] }                       // memory_search: entries tagged projA
+{ "query": "resuming auth", "include_tags": ["projA","shared"],
+  "exclude_tags": ["scratch"] }                              // memory_curate: keep projA OR shared; drop scratch
+{ "prefix": "projA:" }                                       // memory_list_keys: one project's keys
+```
+
+**Make the model tag automatically** — add to its system prompt (LM Studio) or `CLAUDE.md`:
+
+```
+When you store a memory, tag it with the project name (e.g. "projA") plus topic
+tags (e.g. "auth", "billing"), and prefix its key with the project, like
+"projA:decision:auth". Tag anything true across projects with "shared". When
+recalling, call memory_curate with include_tags=["<project>", "shared"] so you
+get both this project's memory and universal knowledge in one call.
+```
+
+That last convention is the tidy answer to sharing without mixing: keep a `shared` tag for
+cross-project truths, and `curate(include_tags=[project, "shared"])` pulls the current project's
+memory **and** the universal facts together — whether they live in one store or in the hybrid's
+read-only global base.
 
 ---
 
