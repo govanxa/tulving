@@ -188,7 +188,8 @@ mypy tulving/                             # strict
 ruff check tulving/ tests/ && ruff format --check tulving/ tests/
 ```
 
-A full manual verification walkthrough lives in `docs/testing_guide.md`.
+CI runs these same gates plus a cross-platform test matrix (Linux + Windows ×
+Python 3.11–3.13) on every push — see `.github/workflows/ci.yml`.
 
 ---
 
