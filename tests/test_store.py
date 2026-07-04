@@ -825,3 +825,94 @@ class TestSQLiteSmoke:
         sqlite_store.forget("k")
         assert sqlite_store.purge_archived() == 1
         assert sqlite_store.get_by_id(entry.id, touch=False) is None
+
+
+# ---------------------------------------------------------------------------
+# blueprint-memory amendments: rebase_importance + forget_by_id
+# ---------------------------------------------------------------------------
+
+
+class TestRebaseImportance:
+    """The owner-visible D2 resolution: update(importance=) is an explicit
+    REBASE — new base_importance AND a fresh decay anchor, in one update."""
+
+    def test_rebase_sets_base_anchor_and_updated_at(
+        self, store: MemoryStore, fake_clock: Any
+    ) -> None:
+        entry = create_fact(store, base_importance=0.8)
+        fake_clock.advance(hours=100)
+        now = fake_clock.current
+        rebased = store.rebase_importance(entry.id, 0.6, now=now)
+        assert rebased.base_importance == 0.6
+        assert rebased.last_accessed_at == now
+        assert rebased.updated_at == now
+        assert rebased.created_at == entry.created_at
+        # A rebase is NOT an access: access_count is untouched.
+        assert rebased.access_count == entry.access_count
+
+    def test_rebase_persists(self, store: MemoryStore, fake_clock: Any) -> None:
+        entry = create_fact(store, base_importance=0.8)
+        fake_clock.advance(hours=1)
+        store.rebase_importance(entry.id, 0.3, now=fake_clock.current)
+        reread = store.get_by_id(entry.id, touch=False)
+        assert reread is not None
+        assert reread.base_importance == 0.3
+        assert reread.last_accessed_at == fake_clock.current
+
+    @pytest.mark.parametrize("bad", [-0.1, 1.1])
+    def test_rebase_out_of_range_rejected(
+        self, store: MemoryStore, fake_clock: Any, bad: float
+    ) -> None:
+        entry = create_fact(store)
+        with pytest.raises(MemoryStoreError):
+            store.rebase_importance(entry.id, bad, now=fake_clock.current)
+
+    def test_rebase_missing_id(self, store: MemoryStore, fake_clock: Any) -> None:
+        with pytest.raises(MemoryStoreError, match="missing"):
+            store.rebase_importance("missing", 0.5, now=fake_clock.current)
+
+    def test_rebase_naive_now_rejected(self, store: MemoryStore) -> None:
+        entry = create_fact(store)
+        with pytest.raises(MemoryStoreError):
+            store.rebase_importance(entry.id, 0.5, now=datetime(2026, 1, 1))
+
+    def test_ordinary_update_still_importance_free(self, store: MemoryStore) -> None:
+        # The blueprint-store invariant stands: no importance parameter on update().
+        assert "importance" not in inspect.signature(store.update).parameters
+        assert "base_importance" not in inspect.signature(store.update).parameters
+
+
+class TestForgetById:
+    """MCP A3: unkeyed entries must be forgettable by id."""
+
+    def test_forget_by_id_soft(self, store: MemoryStore) -> None:
+        entry = create_fact(store)  # unkeyed
+        assert store.forget_by_id(entry.id) is True
+        archived = store.get_by_id(entry.id, touch=False)
+        assert archived is not None
+        assert archived.archived is True
+        assert archived.archive_reason is ArchiveReason.FORGOTTEN
+
+    def test_forget_by_id_hard(self, store: MemoryStore, backend: InMemoryBackend) -> None:
+        entry = create_fact(store, embedding=pack_embedding([1.0]))
+        assert store.forget_by_id(entry.id, hard=True) is True
+        assert store.get_by_id(entry.id, touch=False) is None
+        assert list(backend.iter_embeddings(include_archived=True)) == []
+
+    def test_forget_by_id_missing_returns_false(self, store: MemoryStore) -> None:
+        assert store.forget_by_id("missing") is False
+
+    def test_forget_by_id_already_archived_returns_false(self, store: MemoryStore) -> None:
+        entry = create_fact(store)
+        store.archive(entry.id, ArchiveReason.SUMMARIZED)
+        assert store.forget_by_id(entry.id) is False
+        # The recorded reason is never overwritten (purge-protection regression).
+        after = store.get_by_id(entry.id, touch=False)
+        assert after is not None
+        assert after.archive_reason is ArchiveReason.SUMMARIZED
+
+    def test_forget_by_id_runs_transactionally(self, fake_clock: Any) -> None:
+        backend = _TxnAssertingBackend()
+        store = MemoryStore(backend, clock=fake_clock)
+        entry = create_fact(store)
+        assert store.forget_by_id(entry.id) is True

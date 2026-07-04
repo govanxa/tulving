@@ -10,6 +10,11 @@ import importlib.metadata
 import tulving
 
 EXPECTED_EXPORTS = {
+    # primary API (build step 9)
+    "Memory",
+    "SearchResult",
+    "StartupReport",
+    "LifecycleConfig",
     # enums
     "ArchiveReason",
     "MatchType",
