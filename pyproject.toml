@@ -41,6 +41,9 @@ openai = [
 mcp = [
     "mcp>=1.0",
 ]
+anthropic = [
+    "anthropic>=0.40",
+]
 
 [project.urls]
 Author = "https://github.com/govanxa"
@@ -68,6 +71,16 @@ files = ["tulving"]
 
 [[tool.mypy.overrides]]
 module = "hnswlib"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# Optional extras, imported only inside gated adapter constructors (D9).
+module = ["sentence_transformers", "openai"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# Optional [anthropic] extra, lazily imported inside AnthropicAdapter (D9).
+module = "anthropic"
 ignore_missing_imports = true
 
 [tool.ruff]
