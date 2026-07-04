@@ -9,7 +9,7 @@ description = "The context-budget engine for AI agents — persistent typed memo
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
-authors = [{ name = "Abraham", email = "abraham@fscoder.dev" }]
+authors = [{ name = "Vanxa", email = "info@vanxa.com" }]
 keywords = ["ai", "agents", "memory", "context", "curation", "mcp", "llm"]
 classifiers = [
     "Development Status :: 1 - Planning",
