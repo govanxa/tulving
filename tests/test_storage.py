@@ -1529,3 +1529,171 @@ class TestParameterizationGuard:
         assert self._sql_violations(pragma_ok) == []
         placeholders_ok = 'sql = f"DELETE FROM memories WHERE id IN ({placeholders})"'
         assert self._sql_violations(placeholders_ok) == []
+
+
+# ---------------------------------------------------------------------------
+# Vector labels (parity — schema v2, consumed by semantic_index.py)
+# ---------------------------------------------------------------------------
+
+
+class TestVectorLabels:
+    """The label<->UUID mapping table (schema v2): load/insert/tombstone/replace.
+
+    Rows are (label, entry_id, tombstoned). One LIVE row per entry_id
+    (partial-unique emulation mirrors idx_key_active); tombstoned history
+    rows may coexist with a later live row for the same entry_id — this is
+    what lets the semantic index re-add an entry after remove().
+    """
+
+    def test_load_labels_empty(self, backend: Any) -> None:
+        assert backend.load_labels() == []
+
+    def test_insert_and_load_round_trip_label_asc(self, backend: Any) -> None:
+        backend.insert_labels([(2, "e-b"), (0, "e-a"), (1, "e-c")])
+        assert backend.load_labels() == [(0, "e-a", False), (1, "e-c", False), (2, "e-b", False)]
+
+    def test_duplicate_label_rejected(self, backend: Any) -> None:
+        backend.insert_labels([(0, "e-a")])
+        with pytest.raises(StorageError):
+            backend.insert_labels([(0, "e-b")])
+
+    def test_second_live_row_for_entry_id_rejected(self, backend: Any) -> None:
+        backend.insert_labels([(0, "e-a")])
+        with pytest.raises(StorageError):
+            backend.insert_labels([(1, "e-a")])
+
+    def test_insert_labels_is_all_or_nothing(self, backend: Any) -> None:
+        backend.insert_labels([(0, "e-a")])
+        with pytest.raises(StorageError):
+            backend.insert_labels([(1, "e-b"), (0, "e-dup")])  # second row collides
+        assert backend.load_labels() == [(0, "e-a", False)]
+
+    def test_tombstone_live_row(self, backend: Any) -> None:
+        backend.insert_labels([(0, "e-a")])
+        assert backend.tombstone_label("e-a") is True
+        assert backend.load_labels() == [(0, "e-a", True)]
+
+    def test_tombstone_unknown_entry_returns_false(self, backend: Any) -> None:
+        assert backend.tombstone_label("nope") is False
+
+    def test_tombstone_twice_returns_false(self, backend: Any) -> None:
+        backend.insert_labels([(0, "e-a")])
+        assert backend.tombstone_label("e-a") is True
+        assert backend.tombstone_label("e-a") is False
+
+    def test_tombstone_targets_only_live_row_of_that_entry(self, backend: Any) -> None:
+        """Other entries' rows — live or tombstoned — are never touched."""
+        backend.insert_labels([(0, "e-a"), (1, "e-b"), (2, "e-c")])
+        backend.tombstone_label("e-c")
+        assert backend.tombstone_label("e-b") is True
+        assert backend.load_labels() == [
+            (0, "e-a", False),
+            (1, "e-b", True),
+            (2, "e-c", True),
+        ]
+
+    def test_reinsert_after_tombstone_allowed(self, backend: Any) -> None:
+        """remove() + re-add of the same entry id must work (store update path)."""
+        backend.insert_labels([(0, "e-a")])
+        backend.tombstone_label("e-a")
+        backend.insert_labels([(1, "e-a")])  # new live row; history row kept
+        assert backend.load_labels() == [(0, "e-a", True), (1, "e-a", False)]
+        assert backend.tombstone_label("e-a") is True  # tombstones the LIVE row
+        assert backend.load_labels() == [(0, "e-a", True), (1, "e-a", True)]
+
+    def test_replace_labels_truncates_and_rewrites_all_live(self, backend: Any) -> None:
+        backend.insert_labels([(5, "e-a"), (6, "e-b")])
+        backend.tombstone_label("e-a")
+        backend.replace_labels([(0, "e-b"), (1, "e-c")])
+        assert backend.load_labels() == [(0, "e-b", False), (1, "e-c", False)]
+
+    def test_replace_labels_with_empty_list_truncates(self, backend: Any) -> None:
+        backend.insert_labels([(0, "e-a")])
+        backend.replace_labels([])
+        assert backend.load_labels() == []
+
+    def test_replace_labels_atomic_on_constraint_violation(self, backend: Any) -> None:
+        backend.insert_labels([(0, "e-a")])
+        with pytest.raises(StorageError):
+            backend.replace_labels([(0, "e-b"), (0, "e-c")])  # duplicate label
+        assert backend.load_labels() == [(0, "e-a", False)]
+
+    def test_replace_labels_duplicate_entry_id_rejected(self, backend: Any) -> None:
+        with pytest.raises(StorageError):
+            backend.replace_labels([(0, "e-a"), (1, "e-a")])
+        assert backend.load_labels() == []
+
+    def test_transaction_rollback_covers_labels(self, backend: Any) -> None:
+        backend.insert_labels([(0, "e-a")])
+        with pytest.raises(RuntimeError, match="boom"), backend.transaction():
+            backend.insert_labels([(1, "e-b")])
+            backend.tombstone_label("e-a")
+            raise RuntimeError("boom")
+        assert backend.load_labels() == [(0, "e-a", False)]
+
+    def test_labels_after_close_raise(self, backend: Any) -> None:
+        backend.close()
+        with pytest.raises(StorageError):
+            backend.load_labels()
+        with pytest.raises(StorageError):
+            backend.insert_labels([(0, "e-a")])
+        with pytest.raises(StorageError):
+            backend.tombstone_label("e-a")
+        with pytest.raises(StorageError):
+            backend.replace_labels([])
+
+    def test_labels_do_not_require_entry_rows(self, backend: Any) -> None:
+        """The mapping is reconciled against memories by semantic_index, not FK-coupled."""
+        backend.insert_labels([(0, "no-such-entry")])
+        assert backend.load_labels() == [(0, "no-such-entry", False)]
+
+
+class TestVectorLabelsMigration:
+    """SQLite-only: the v1 -> v2 migration step."""
+
+    def test_fresh_db_has_vector_labels_table(self, sqlite_backend: SQLiteBackend) -> None:
+        assert sqlite_backend.load_labels() == []
+        with closing(sqlite3.connect(sqlite_backend.db_path)) as conn:
+            names = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+        assert "vector_labels" in names
+
+    def test_v1_database_upgrades_to_v2(self, tmp_path: Path) -> None:
+        """A pre-existing v1 file gains vector_labels; data survives; versions advance."""
+        db = tmp_path / "t.db"
+        b = SQLiteBackend(db)
+        b.create(make_row("e1", key="k1"), embedding=pack_embedding([1.0, 2.0]))
+        b.close()
+        # Rewind the file to schema v1 (drop the v2 table, reset both versions).
+        with closing(sqlite3.connect(db)) as conn, conn:
+            conn.execute("DROP TABLE vector_labels")
+            conn.execute("PRAGMA user_version = 1")
+            conn.execute("UPDATE meta SET schema_version = 1 WHERE id = 1")
+        b = SQLiteBackend(db)
+        try:
+            assert b.get_meta()["schema_version"] == SCHEMA_VERSION
+            assert b.load_labels() == []
+            b.insert_labels([(0, "e1")])
+            assert b.load_labels() == [(0, "e1", False)]
+            assert b.read("e1") is not None  # v1 data survives the step
+            assert b.get_embedding("e1") == pack_embedding([1.0, 2.0])
+        finally:
+            b.close()
+        with closing(sqlite3.connect(db)) as conn:
+            assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+
+    def test_v2_labels_persist_across_reopen(self, tmp_path: Path) -> None:
+        db = tmp_path / "t.db"
+        b = SQLiteBackend(db)
+        b.insert_labels([(0, "e-a"), (1, "e-b")])
+        b.tombstone_label("e-a")
+        b.close()
+        b = SQLiteBackend(db)
+        try:
+            assert b.load_labels() == [(0, "e-a", True), (1, "e-b", False)]
+        finally:
+            b.close()
