@@ -15,6 +15,7 @@ from tulving.adapters.embeddings import (
     LocalEmbedder,
     OpenAIEmbedder,
 )
+from tulving.context.config import LifecycleConfig
 from tulving.entry import MemoryEntry, Relationship, SourceInfo
 from tulving.enums import ArchiveReason, MatchType, MemoryType, SessionStatus
 from tulving.exceptions import (
@@ -26,6 +27,7 @@ from tulving.exceptions import (
     TulvingError,
     VectorIndexError,
 )
+from tulving.memory import Memory, SearchResult, StartupReport
 
 __version__ = "0.0.1"
 
@@ -34,17 +36,21 @@ __all__ = [
     "ConfigError",
     "EmbeddingAdapter",
     "HashEmbedder",
+    "LifecycleConfig",
     "LocalEmbedder",
     "MatchType",
+    "Memory",
     "MemoryEntry",
     "MemoryStoreError",
     "MemoryType",
     "OpenAIEmbedder",
     "Relationship",
     "ScopeError",
+    "SearchResult",
     "SecurityError",
     "SessionStatus",
     "SourceInfo",
+    "StartupReport",
     "StorageError",
     "TulvingError",
     "VectorIndexError",

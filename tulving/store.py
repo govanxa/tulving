@@ -418,6 +418,45 @@ class MemoryStore:
             raise MemoryStoreError(f"no entry with id {entry_id!r}")
         return self._hydrate(row)
 
+    def rebase_importance(self, entry_id: str, new_base: float, *, now: datetime) -> MemoryEntry:
+        """EXPLICIT importance rebase (blueprint-memory amendment, owner-approved).
+
+        In one backend update: sets ``base_importance = new_base`` AND resets
+        the decay anchor (``last_accessed_at = now``), bumping ``updated_at``.
+        Semantics: *"as of now, this memory is worth new_base"* — a fresh
+        statement of importance whose decay starts when it was made. This is
+        the ONLY importance mutation path (D2 stands: ``update()`` remains
+        importance-free; decay/eviction/curation can never reach this).
+
+        A rebase is NOT an access: ``access_count`` is untouched.
+
+        Args:
+            entry_id: The entry to rebase.
+            new_base: The new base importance, within [0.0, 1.0].
+            now: The rebase instant (tz-aware); becomes the new decay anchor.
+
+        Returns:
+            The rebased entry.
+
+        Raises:
+            MemoryStoreError: On a missing id, out-of-range value, or naive
+                ``now``.
+        """
+        if not 0.0 <= new_base <= 1.0:
+            raise MemoryStoreError(f"importance must be within [0.0, 1.0], got {new_base!r}")
+        instant = _aware_iso(now, "now")
+        row = self._backend.update(
+            entry_id,
+            {
+                "base_importance": new_base,
+                "last_accessed_at": instant,
+                "updated_at": instant,
+            },
+        )
+        if row is None:
+            raise MemoryStoreError(f"no entry with id {entry_id!r}")
+        return self._hydrate(row)
+
     def set_embedding(self, entry_id: str, embedding: bytes | None) -> None:
         """Passthrough for memory.py's re-embed path.
 
@@ -513,6 +552,32 @@ class MemoryStore:
                 self._delete(row["id"])
             else:
                 self._archive_checked(row["id"], ArchiveReason.FORGOTTEN)
+        return True
+
+    def forget_by_id(self, entry_id: str, *, hard: bool = False) -> bool:
+        """Forget an entry by id (blueprint-memory amendment; MCP A3 requires
+        reaching unkeyed entries).
+
+        Mirrors ``forget(key)`` miss semantics: a missing id or an
+        already-archived entry returns ``False``, never raises — and never
+        overwrites an existing archive reason (a SUMMARIZED source relabeled
+        FORGOTTEN would lose its purge protection).
+
+        Args:
+            entry_id: The entry to forget.
+            hard: When True, hard-delete the row (embedding dies with it).
+
+        Returns:
+            True when a live entry was archived (or hard-deleted).
+        """
+        with self._backend.transaction():
+            row = self._backend.read(entry_id)
+            if row is None or row["archived"]:
+                return False
+            if hard:
+                self._delete(entry_id)
+            else:
+                self._archive_checked(entry_id, ArchiveReason.FORGOTTEN)
         return True
 
     def purge_archived(
