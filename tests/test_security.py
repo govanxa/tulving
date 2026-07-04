@@ -37,6 +37,11 @@ class TestPathContainmentFailures:
         with pytest.raises(SecurityError):
             contain_path("../../etc/passwd", root)
 
+    @pytest.mark.skipif(
+        sys.platform != "win32",
+        reason="backslash is a path separator only on Windows; on POSIX it is a literal "
+        "filename char, so this cannot traverse (covered by the forward-slash tests)",
+    )
     def test_backslash_dotdot_traversal(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -425,6 +430,11 @@ class TestPathContainmentHappy:
         result = contain_path("~/tulving-test-file", "~")
         assert result == (Path.home() / "tulving-test-file").resolve()
 
+    @pytest.mark.skipif(
+        sys.platform != "win32",
+        reason="mixed \\ and / separators normalize to path parts only on Windows; "
+        "on POSIX backslash is a literal filename char",
+    )
     def test_mixed_separators(self, tmp_path: Path) -> None:
         mixed = f"{tmp_path}/allowed\\sub/file"
         result = contain_path(mixed, tmp_path)

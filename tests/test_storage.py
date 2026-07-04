@@ -12,6 +12,7 @@ import os
 import re
 import sqlite3
 import struct
+import sys
 import threading
 from collections.abc import Iterator
 from contextlib import closing
@@ -1386,6 +1387,9 @@ class TestCloudSyncRisk:
     def test_google_drive_segment_detected(self, tmp_path: Path) -> None:
         assert cloud_sync_risk(tmp_path / "Google Drive" / "db.sqlite") is not None
 
+    @pytest.mark.skipif(
+        sys.platform != "win32", reason="UNC paths (\\\\server\\share) exist only on Windows"
+    )
     def test_unc_path_detected(self) -> None:
         assert cloud_sync_risk("\\\\server\\share\\db.sqlite") is not None
 

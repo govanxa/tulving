@@ -25,6 +25,7 @@ import json
 import os
 import sqlite3
 import struct
+import sys
 import threading
 import warnings
 from collections.abc import Callable, Iterator, Sequence
@@ -194,7 +195,7 @@ def cloud_sync_risk(path: str | Path) -> str | None:
                 return f"path lies under the {var} environment root"
         if resolved.startswith("\\\\"):
             return "UNC network path"
-        if os.name == "nt":
+        if sys.platform == "win32":
             import ctypes
 
             drive = os.path.splitdrive(resolved)[0]
@@ -920,6 +921,12 @@ class SQLiteBackend:
                 f"sqlite3 threadsafety is {sqlite3.threadsafety}; SQLiteBackend requires "
                 "serialized mode (3) — close() reaches other threads' connections"
             )
+        # Reject embedded NUL uniformly across platforms (never echo the raw
+        # path). On Windows a NUL in the leaf trips .parent.mkdir below; on
+        # POSIX (backslashes are literal) it would otherwise slip through to
+        # sqlite3.connect and escape as a raw ValueError. Guard once, up front.
+        if "\x00" in str(db_path):
+            raise StorageError("database path contains an embedded null byte")
         self._db_path = Path(db_path)
         self._busy_timeout_ms = int(busy_timeout_ms)
         self._closed = False
