@@ -36,13 +36,14 @@ from typing import TYPE_CHECKING, Any, Final, Protocol
 from tulving.enums import ArchiveReason, MemoryType, SessionStatus
 from tulving.exceptions import StorageError
 
-SCHEMA_VERSION: Final[int] = 1
+SCHEMA_VERSION: Final[int] = 2
 
 # Type aliases (module level so annotations inside classes that define a
 # method named ``list`` never resolve against the class scope).
 _Row = dict[str, Any]
 _Rows = list[dict[str, Any]]
 _Keys = list[str]
+_LabelRows = list[tuple[int, str, bool]]
 
 _TIMESTAMP_FIELDS: Final[frozenset[str]] = frozenset(
     {"created_at", "updated_at", "last_accessed_at"}
@@ -528,6 +529,22 @@ class StorageBackend(Protocol):
         """Set the three embedding fields; schema_version is refused."""
         ...
 
+    def load_labels(self) -> _LabelRows:
+        """All (label, entry_id, tombstoned) mapping rows, label ASC."""
+        ...
+
+    def insert_labels(self, rows: Sequence[tuple[int, str]]) -> None:
+        """Insert live mapping rows atomically; constraint hit sinks the batch."""
+        ...
+
+    def tombstone_label(self, entry_id: str) -> bool:
+        """Tombstone the LIVE row for ``entry_id``; False when none exists."""
+        ...
+
+    def replace_labels(self, rows: Sequence[tuple[int, str]]) -> None:
+        """Atomic truncate + rewrite (rebuild path); all rows live."""
+        ...
+
     def transaction(self) -> AbstractContextManager[None]:
         """Explicit atomic scope; non-reentrant (nesting raises)."""
         ...
@@ -616,7 +633,36 @@ def _migrate_v1(conn: sqlite3.Connection) -> None:
         conn.execute(statement)
 
 
-_MIGRATIONS: Final[dict[int, Callable[[sqlite3.Connection], None]]] = {1: _migrate_v1}
+# v2: the semantic index's label<->UUID mapping (blueprint-semantic-index §4).
+# One LIVE row per entry_id via a partial unique index (mirrors idx_key_active)
+# so tombstoned history rows can coexist with a later live row — this is what
+# lets the semantic index re-add an entry after remove(). No FK to memories:
+# the mapping is reconciled against it at startup, not cascade-coupled.
+_V2_DDL: Final[tuple[str, ...]] = (
+    """
+    CREATE TABLE vector_labels (
+        label      INTEGER PRIMARY KEY,
+        entry_id   TEXT NOT NULL,
+        tombstoned INTEGER NOT NULL DEFAULT 0
+    )
+    """,
+    """
+    CREATE UNIQUE INDEX idx_vector_label_active ON vector_labels(entry_id)
+        WHERE tombstoned = 0
+    """,
+)
+
+
+def _migrate_v2(conn: sqlite3.Connection) -> None:
+    """Add the vector_labels mapping table (schema v2)."""
+    for statement in _V2_DDL:
+        conn.execute(statement)
+
+
+_MIGRATIONS: Final[dict[int, Callable[[sqlite3.Connection], None]]] = {
+    1: _migrate_v1,
+    2: _migrate_v2,
+}
 
 
 def _run_migrations(conn: sqlite3.Connection) -> None:
@@ -1285,6 +1331,54 @@ class SQLiteBackend:
                 merged,
             )
 
+    # ------------------------------------------------------- vector labels
+
+    def load_labels(self) -> _LabelRows:
+        """All (label, entry_id, tombstoned) mapping rows, label ASC."""
+        conn = self._connection()
+        rows = self._execute(
+            conn, "SELECT label, entry_id, tombstoned FROM vector_labels ORDER BY label ASC"
+        ).fetchall()
+        return [(int(row[0]), row[1], bool(row[2])) for row in rows]
+
+    def insert_labels(self, rows: Sequence[tuple[int, str]]) -> None:
+        """Insert live mapping rows atomically.
+
+        A duplicate label or a second LIVE row for the same entry_id (the
+        partial unique index) sinks the whole batch with ``StorageError``.
+        Tombstoned history rows for the same entry_id never collide.
+        """
+        if not rows:
+            return
+        with self._atomic() as conn:
+            for label, entry_id in rows:
+                self._execute(
+                    conn,
+                    "INSERT INTO vector_labels (label, entry_id, tombstoned) VALUES (?, ?, 0)",
+                    (label, entry_id),
+                )
+
+    def tombstone_label(self, entry_id: str) -> bool:
+        """Tombstone the LIVE row for ``entry_id``; False when none exists."""
+        with self._atomic() as conn:
+            cursor = self._execute(
+                conn,
+                "UPDATE vector_labels SET tombstoned = 1 WHERE entry_id = ? AND tombstoned = 0",
+                (entry_id,),
+            )
+            return cursor.rowcount > 0
+
+    def replace_labels(self, rows: Sequence[tuple[int, str]]) -> None:
+        """Atomic truncate + rewrite (rebuild path); all rows live."""
+        with self._atomic() as conn:
+            self._execute(conn, "DELETE FROM vector_labels")
+            for label, entry_id in rows:
+                self._execute(
+                    conn,
+                    "INSERT INTO vector_labels (label, entry_id, tombstoned) VALUES (?, ?, 0)",
+                    (label, entry_id),
+                )
+
     # ----------------------------------------------------------- atomicity
 
     @contextmanager
@@ -1332,6 +1426,7 @@ class InMemoryBackend:
         self._entries: dict[str, _Row] = {}
         self._embeddings: dict[str, bytes] = {}
         self._sessions: dict[str, _Row] = {}
+        self._labels: dict[int, tuple[str, bool]] = {}  # label -> (entry_id, tombstoned)
         self._meta: _Row = {
             "schema_version": SCHEMA_VERSION,
             "embedding_model_id": None,
@@ -1601,6 +1696,60 @@ class InMemoryBackend:
         with self._lock:
             self._meta.update(validated)
 
+    # ------------------------------------------------------- vector labels
+
+    @staticmethod
+    def _check_label_rows(
+        existing: dict[int, tuple[str, bool]], rows: Sequence[tuple[int, str]]
+    ) -> None:
+        """Emulate the label PRIMARY KEY and the partial unique index."""
+        live_ids = {entry_id for entry_id, tombstoned in existing.values() if not tombstoned}
+        seen_labels = set(existing)
+        for label, entry_id in rows:
+            if label in seen_labels:
+                raise StorageError(f"constraint violation: duplicate label {label}")
+            if entry_id in live_ids:
+                raise StorageError(
+                    f"constraint violation: entry {entry_id!r} already holds a live label "
+                    f"(partial unique index)"
+                )
+            seen_labels.add(label)
+            live_ids.add(entry_id)
+
+    def load_labels(self) -> _LabelRows:
+        """All (label, entry_id, tombstoned) mapping rows, label ASC."""
+        self._ensure_open()
+        with self._lock:
+            return [
+                (label, entry_id, tombstoned)
+                for label, (entry_id, tombstoned) in sorted(self._labels.items())
+            ]
+
+    def insert_labels(self, rows: Sequence[tuple[int, str]]) -> None:
+        """Insert live mapping rows atomically; constraint hit sinks the batch."""
+        self._ensure_open()
+        with self._lock:
+            self._check_label_rows(self._labels, rows)
+            for label, entry_id in rows:
+                self._labels[label] = (entry_id, False)
+
+    def tombstone_label(self, entry_id: str) -> bool:
+        """Tombstone the LIVE row for ``entry_id``; False when none exists."""
+        self._ensure_open()
+        with self._lock:
+            for label, (row_entry_id, tombstoned) in self._labels.items():
+                if row_entry_id == entry_id and not tombstoned:
+                    self._labels[label] = (entry_id, True)
+                    return True
+            return False
+
+    def replace_labels(self, rows: Sequence[tuple[int, str]]) -> None:
+        """Atomic truncate + rewrite (rebuild path); all rows live."""
+        self._ensure_open()
+        with self._lock:
+            self._check_label_rows({}, rows)
+            self._labels = {label: (entry_id, False) for label, entry_id in rows}
+
     # ----------------------------------------------------------- atomicity
 
     @contextmanager
@@ -1616,16 +1765,18 @@ class InMemoryBackend:
                 dict(self._embeddings),
                 copy.deepcopy(self._sessions),
                 dict(self._meta),
+                dict(self._labels),
             )
             self._local.in_txn = True
             try:
                 yield
             except Exception:
-                self._entries, self._embeddings, self._sessions, self._meta = (
+                self._entries, self._embeddings, self._sessions, self._meta, self._labels = (
                     copy.deepcopy(snapshot[0]),
                     dict(snapshot[1]),
                     copy.deepcopy(snapshot[2]),
                     dict(snapshot[3]),
+                    dict(snapshot[4]),
                 )
                 raise
             finally:
