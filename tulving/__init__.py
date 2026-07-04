@@ -16,6 +16,7 @@ from tulving.adapters.embeddings import (
     OpenAIEmbedder,
 )
 from tulving.context.config import LifecycleConfig
+from tulving.context.curator import CuratedContext
 from tulving.context.lifecycle import Session, SessionSummary
 from tulving.entry import MemoryEntry, Relationship, SourceInfo
 from tulving.enums import ArchiveReason, MatchType, MemoryType, SessionStatus
@@ -35,6 +36,7 @@ __version__ = "0.0.1"
 __all__ = [
     "ArchiveReason",
     "ConfigError",
+    "CuratedContext",
     "EmbeddingAdapter",
     "HashEmbedder",
     "LifecycleConfig",

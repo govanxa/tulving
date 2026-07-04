@@ -46,6 +46,7 @@ from tulving.adapters.embeddings import EmbeddingAdapter
 from tulving.adapters.llm import LLMAdapter
 from tulving.adapters.storage import SQLiteBackend, StorageBackend, cloud_sync_risk
 from tulving.context.config import LifecycleConfig
+from tulving.context.curator import ContextCurator, CuratedContext
 from tulving.context.decay import DecayReport
 from tulving.context.decay import effective_importance as _effective_importance
 from tulving.context.decay import evict as _decay_evict
@@ -201,7 +202,7 @@ class CuratorPort(Protocol):
         mode: str = "query",
         include_tags: list[str] | None = None,
         exclude_tags: list[str] | None = None,
-    ) -> Any: ...
+    ) -> CuratedContext: ...
 
 
 class SummarizerPort(Protocol):
@@ -1237,33 +1238,42 @@ class Memory:
         mode: str = "query",
         include_tags: list[str] | None = None,
         exclude_tags: list[str] | None = None,
-    ) -> Any:
+    ) -> CuratedContext:
         """Token-budget context curation — delegation to the ContextCurator.
 
-        Returns ``CuratedContext`` (content ALREADY redacted) once build
-        step 10 lands. The return type is ``Any`` only until then.
-
-        Raises:
-            NotImplementedError: Until a curator is wired (build step 10) —
-                Memory's ``RetrievalPort`` implementation is ready.
+        Returns a ``CuratedContext`` whose ``content`` is ALREADY redacted;
+        ``entries`` carries raw, unredacted ``MemoryEntry`` objects (never emit
+        those to an egress surface — see ``CuratedContext``). Uses an injected
+        ``Memory(curator=...)`` when supplied, otherwise a default
+        ``ContextCurator`` built lazily over Memory's ``RetrievalPort``
+        (``_RetrievalAdapter``), its decay-backed ``ImportanceEvaluator``
+        (``_DecayEvaluator``), the wired ``token_safety_margin``
+        (``LifecycleConfig``), and the compiled sensitive-key patterns.
         """
         self._ensure_started()
-        # TODO(step 10): this seam MUST be replaced by real ContextCurator
-        # wiring BEFORE mcp/server.py (step 14) is built — the MCP `curate`
-        # and `orient` tools depend on it.
-        if self._curator is None:
-            raise NotImplementedError(
-                "ContextCurator lands at build step 10; Memory's RetrievalPort "
-                "(_RetrievalAdapter) is ready — construct the curator over it and "
-                "inject via Memory(curator=...) or wire the default here."
-            )
-        return self._curator.curate(
+        return self._get_curator().curate(
             query,
             token_budget=token_budget,
             mode=mode,
             include_tags=include_tags,
             exclude_tags=exclude_tags,
         )
+
+    def _get_curator(self) -> CuratorPort:
+        """The injected curator, or a lazily-built default over the port (D8).
+
+        Lazy so the tiktoken probe never runs at construction; memoized so one
+        curator (and one resolved estimator) serves the handle's lifetime.
+        """
+        if self._curator is None:
+            self._curator = ContextCurator(
+                self._retrieval,
+                self._evaluator,
+                token_safety_margin=self._config.token_safety_margin,
+                key_patterns=self._key_patterns,
+                now_fn=self._clock,
+            )
+        return self._curator
 
     # -------------------------------------------------------------------- edit
 
