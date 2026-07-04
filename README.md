@@ -26,6 +26,9 @@ each with its own lifecycle — are Tulving's core data model.
 
 Zero infrastructure: one SQLite file, no server, no API key required. Vectors are optional.
 
+> 📖 **New here? Read the [User Guide](GUIDE.md)** — using Tulving with LM Studio, Claude Code,
+> and the MCP Inspector; verifying it works; and measuring the value it adds over no memory.
+
 ---
 
 ## Install
@@ -190,6 +193,9 @@ ruff check tulving/ tests/ && ruff format --check tulving/ tests/
 
 CI runs these same gates plus a cross-platform test matrix (Linux + Windows ×
 Python 3.11–3.13) on every push — see `.github/workflows/ci.yml`.
+
+The [User Guide](GUIDE.md) covers real-world usage (LM Studio, Claude Code, MCP Inspector),
+behavior verification, and how to measure Tulving against having no memory at all.
 
 ---
 
