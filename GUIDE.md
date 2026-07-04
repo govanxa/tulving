@@ -295,10 +295,25 @@ claude mcp add --scope user tulving-shared -- \
 ```
 
 In a session the tools appear as `tulving:memory_*` (your project) and `tulving-shared:memory_*`
-(the global knowledge base). You **write** to the global store from one dedicated session — run a
-*writable* server on `/home/you/.tulving/global` in a single "notes" project, or populate it with a
-short Python script — and every other project reads it. `tulving-shared`'s `store`/`forget` tools
-return an error, which is the read-only guarantee working as intended.
+(the global knowledge base). `tulving-shared`'s `store`/`forget` tools return an error, which is
+the read-only guarantee working as intended.
+
+**Telling the agent where to save (local vs. shared).** The agent picks the store by the tool it
+calls — `tulving:memory_store` writes this project's memory; `tulving-shared` is read-only, so it
+*cannot* write there. In normal work the agent therefore saves everything locally, and simply
+*reads* `tulving-shared` for cross-project facts. To **add** to the shared base, use one dedicated
+"knowledge-base" project whose `.mcp.json` registers a **writable** server (e.g. `tulving-kb`) on
+the same global path; open that project and tell the agent to store there, or populate it with a
+short Python script. Only one writable server may hold the global path at a time, so keep writes to
+that single knowledge-base session — every other project reads the result (picking up new entries
+the next time its read-only session starts). Make the distinction explicit in each project's
+`CLAUDE.md`; ready-to-paste blocks for all three setups are in
+[`examples/claude-md-memory-snippet.md`](examples/claude-md-memory-snippet.md).
+
+> Prefer writing shared knowledge on demand from *any* session? Then make the shared server
+> **writable** instead of read-only — but only one Claude Code instance can hold it at a time, so
+> this trades away parallel use. Read-only shared + a dedicated writer is what keeps many sessions
+> working at once.
 
 #### Tagging & key prefixes — organizing within a store
 
