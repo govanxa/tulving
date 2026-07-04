@@ -82,6 +82,8 @@ select = [
     "B",                # bugbear
     "SIM",              # simplify
     "RUF",
+    "A001",             # builtin shadowing at module level (D6 backstop; NOT A003 —
+                        # it would flag the architecture-mandated MemoryEntry.id/type)
 ]
 
 [tool.ruff.lint.per-file-ignores]
@@ -89,6 +91,7 @@ select = [
 
 [tool.coverage.run]
 source = ["tulving"]
+branch = true
 
 [tool.coverage.report]
 exclude_lines = [
