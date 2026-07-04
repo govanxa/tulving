@@ -925,7 +925,7 @@ class SQLiteBackend:
         # path). On Windows a NUL in the leaf trips .parent.mkdir below; on
         # POSIX (backslashes are literal) it would otherwise slip through to
         # sqlite3.connect and escape as a raw ValueError. Guard once, up front.
-        if "\x00" in str(db_path):
+        if "\x00" in os.fspath(db_path):
             raise StorageError("database path contains an embedded null byte")
         self._db_path = Path(db_path)
         self._busy_timeout_ms = int(busy_timeout_ms)
@@ -936,8 +936,8 @@ class SQLiteBackend:
         try:
             self._db_path.parent.mkdir(parents=True, exist_ok=True)
         except (OSError, ValueError) as exc:
-            # ValueError: embedded NUL and similar malformed paths. Do not
-            # echo the raw path in the message.
+            # Embedded NUL is already rejected up front; this still guards other
+            # malformed/unusable paths. Do not echo the raw path in the message.
             detail = getattr(exc, "strerror", None) or "invalid or unusable path"
             raise StorageError(f"cannot create database parent directory: {detail}") from exc
         reason = cloud_sync_risk(self._db_path)
