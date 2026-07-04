@@ -1,0 +1,27 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tulving"
+version = "0.0.1"
+description = "The context-budget engine for AI agents — persistent typed memory with token-budget curation. Name-holding pre-release; v0.1 in active development."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Abraham", email = "abraham@fscoder.dev" }]
+keywords = ["ai", "agents", "memory", "context", "curation", "mcp", "llm"]
+classifiers = [
+    "Development Status :: 1 - Planning",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Author = "https://github.com/govanxa"
+
+[tool.hatch.build.targets.wheel]
+packages = ["tulving"]

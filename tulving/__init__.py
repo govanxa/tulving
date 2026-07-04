@@ -1,0 +1,12 @@
+"""Tulving — the context-budget engine for AI agents.
+
+Persistent, typed, searchable working memory for a single AI agent, with
+token-budget context curation (``curate(query, token_budget)``) as the
+headline primitive. Named after Endel Tulving, the psychologist who
+established that memory has types.
+
+This is a name-holding pre-release (0.0.1). The v0.1 implementation is in
+active development.
+"""
+
+__version__ = "0.0.1"
