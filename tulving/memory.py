@@ -17,8 +17,9 @@ Integration seams (this is build step 9; steps 10-13 land later):
 - lifecycle: ``_DefaultLifecycleManager`` implements the blueprint's L1-L7
   seam minimally (real per-agent session rows; abandonment/staleness are
   deferred no-ops until step 13).
-- decay: the D2 formula lives here as a pure default
-  (``_effective_importance``) until ``context/decay.py`` lands (step 11).
+- decay: delegated to ``tulving.context.decay`` (build step 11) — the D2
+  formula lives there and only there (D12); ``_EvictionAdapter`` bridges the
+  ``EvictionStore`` protocol onto the store + index tombstoning.
 """
 
 from __future__ import annotations
@@ -26,7 +27,6 @@ from __future__ import annotations
 import inspect
 import json
 import logging
-import math
 import os
 import socket
 import sys
@@ -34,7 +34,7 @@ import threading
 import time
 import uuid
 import warnings
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
@@ -46,6 +46,9 @@ from tulving.adapters.embeddings import EmbeddingAdapter
 from tulving.adapters.llm import LLMAdapter
 from tulving.adapters.storage import SQLiteBackend, StorageBackend, cloud_sync_risk
 from tulving.context.config import LifecycleConfig
+from tulving.context.decay import DecayReport
+from tulving.context.decay import effective_importance as _effective_importance
+from tulving.context.decay import evict as _decay_evict
 from tulving.entry import MemoryEntry, Relationship, SourceInfo, utcnow
 from tulving.enums import ArchiveReason, MatchType, MemoryType, SessionStatus
 from tulving.exceptions import (
@@ -83,64 +86,38 @@ _EMBEDDING_ADAPTER_SURFACE: Final[tuple[str, ...]] = (
 )
 
 # ---------------------------------------------------------------------------
-# Decay seam (pure default until context/decay.py lands — build step 11)
+# Decay wiring (formula + eviction pass live in context/decay.py — D12)
 # ---------------------------------------------------------------------------
 
 
-@dataclass(frozen=True)
-class DecayReport:
-    """Outcome of one eviction pass.
+class _EvictionAdapter:
+    """``context.decay.EvictionStore`` over Memory's store + index.
 
-    TODO(step 11): replace with ``tulving.context.decay.DecayReport`` when
-    the decay module lands — the field inventory matches blueprint-decay
-    exactly, so the swap is type-shape compatible.
+    ``archive_entry`` mirrors the pre-step-11 eviction write exactly: the
+    store archives the row (DB-first, ADR-015; timestamps come from the
+    same clock source as the pass's ``now``) and the vector is tombstoned
+    best-effort.
     """
 
-    entries_scanned: int
-    entries_evicted: int
-    entries_exempted: int
+    def __init__(self, memory: Memory) -> None:
+        self._memory = memory
 
+    def iter_active_entries(self) -> Iterator[MemoryEntry]:
+        """Paged active-entry scan; access-neutral (never touches)."""
+        yield from self._memory._all_active_entries()
 
-def _is_decay_exempt(entry: MemoryEntry) -> bool:
-    """True when the entry never decays and never evicts (D2/D6)."""
-    return entry.pinned or entry.type is MemoryType.DECISION
+    def archive_entry(self, entry_id: str, reason: ArchiveReason, *, now: datetime) -> None:
+        """Archive one row, then tombstone its vector (logged, never raised).
 
-
-def _effective_importance(
-    entry: MemoryEntry,
-    now: datetime,
-    half_life_hours: Mapping[MemoryType, float],
-) -> float:
-    """THE decay formula (D2), computed on read, never written back.
-
-    Pure default seam: the implementation matches blueprint-decay verbatim.
-    TODO(step 11): delegate to ``tulving.context.decay.effective_importance``
-    once ``context/decay.py`` lands, keeping the formula in one place (D12).
-
-    Raises:
-        ValueError: On a naive ``now`` (programming error, entry.py style).
-        ConfigError: On a missing type key or a non-positive/NaN half-life
-            (defense in depth — normally impossible post LifecycleConfig).
-    """
-    if now.tzinfo is None:
-        raise ValueError("now must be timezone-aware (naive datetime rejected)")
-    if _is_decay_exempt(entry):
-        return entry.base_importance
-    half_life = half_life_hours.get(entry.type)
-    if half_life is None:
-        raise ConfigError(f"no half-life configured for type {entry.type.value!r}")
-    if isinstance(half_life, bool) or math.isnan(half_life) or half_life <= 0:
-        raise ConfigError(
-            f"half-life for {entry.type.value!r} must be a positive number, got {half_life!r}"
-        )
-    if math.isinf(half_life):
-        return entry.base_importance
-    anchor = entry.last_accessed_at
-    if anchor is None:  # pragma: no cover - normalized in MemoryEntry.__post_init__
-        anchor = entry.created_at
-    hours = max((now - anchor).total_seconds() / 3600.0, 0.0)
-    factor: float = 0.5 ** (hours / half_life)
-    return entry.base_importance * factor
+        ``now`` (the pass's evaluation instant) is accepted per the protocol
+        but not threaded through: ``store.archive`` stamps ``updated_at``
+        from its own read of the same clock SOURCE, which under the
+        production wall clock may trail ``now`` by the scan latency (the two
+        coincide under an injected fixed clock, as in tests).
+        """
+        del now  # same clock source; store.archive takes its own reading
+        self._memory._store.archive(entry_id, reason)
+        self._memory._semantic_remove(entry_id)
 
 
 class _DecayEvaluator:
@@ -955,28 +932,12 @@ class Memory:
     def _run_eviction(self, now: datetime) -> DecayReport:
         """Reason-aware eviction pass (D2): archive-state writes only.
 
-        Pure-default seam: TODO(step 11) delegate to
-        ``context.decay.evict`` via an ``_EvictionAdapter`` once the decay
-        module lands. Exemptions (pinned/DECISION) are checked BEFORE any
-        threshold evaluation; eviction is strictly ``<`` the threshold.
+        Delegates to ``tulving.context.decay.evict`` via ``_EvictionAdapter``
+        (D12: the formula and the pass live in one place). Exemptions
+        (pinned/DECISION) are checked BEFORE any threshold evaluation;
+        eviction is strictly ``<`` the threshold.
         """
-        scanned = evicted = exempted = 0
-        for entry in self._all_active_entries():
-            scanned += 1
-            if _is_decay_exempt(entry):
-                exempted += 1
-                continue
-            effective = _effective_importance(entry, now, self._config.half_life_hours)
-            if effective < self._config.eviction_threshold:
-                self._store.archive(entry.id, ArchiveReason.EVICTED)
-                self._semantic_remove(entry.id)
-                evicted += 1
-                logger.debug("evicted entry %s (effective importance below threshold)", entry.id)
-        if evicted:
-            logger.info(
-                "eviction pass: scanned=%d evicted=%d exempted=%d", scanned, evicted, exempted
-            )
-        return DecayReport(scanned, evicted, exempted)
+        return _decay_evict(_EvictionAdapter(self), self._config, now=now)
 
     def close(self) -> None:
         """Idempotent, best-effort shutdown; never raises.
