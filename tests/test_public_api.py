@@ -24,6 +24,9 @@ EXPECTED_EXPORTS = {
     "MemoryEntry",
     "Relationship",
     "SourceInfo",
+    # lifecycle session types (build step 13; manager itself stays internal)
+    "Session",
+    "SessionSummary",
     # embedding adapters (heavy deps gated inside constructors — import is safe)
     "EmbeddingAdapter",
     "HashEmbedder",

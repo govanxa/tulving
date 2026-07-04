@@ -916,3 +916,53 @@ class TestForgetById:
         store = MemoryStore(backend, clock=fake_clock)
         entry = create_fact(store)
         assert store.forget_by_id(entry.id) is True
+
+
+# ---------------------------------------------------------------------------
+# Reserved session-marker namespace (SEC-SEV-001 — review fix batch, step 13)
+# ---------------------------------------------------------------------------
+
+
+class TestReservedSessionKeyNamespace:
+    """User create paths must never reach the lifecycle marker namespace:
+    a caller storing ``session:*`` would D1-supersede a genuine marker."""
+
+    def test_create_rejects_reserved_session_prefix(self, store: MemoryStore) -> None:
+        with pytest.raises(MemoryStoreError, match="reserved"):
+            create_fact(store, key="session:abc123")
+
+    def test_create_rejects_bare_prefix_key(self, store: MemoryStore) -> None:
+        with pytest.raises(MemoryStoreError, match="reserved"):
+            create_fact(store, key="session:")
+
+    def test_batch_create_rejects_reserved_prefix_atomically(self, store: MemoryStore) -> None:
+        items: list[dict[str, Any]] = [
+            {"content": "fine", "type": MemoryType.FACT, "source": src(), "key": "safe-key"},
+            {"content": "squat", "type": MemoryType.FACT, "source": src(), "key": "session:x"},
+        ]
+        with pytest.raises(MemoryStoreError, match="reserved"):
+            store.batch_create(items)
+        # all-or-nothing: the valid sibling was not persisted either
+        assert store.get_by_key("safe-key", touch=False) is None
+
+    def test_summarizer_escape_hatch_does_not_bypass_the_guard(self, store: MemoryStore) -> None:
+        with pytest.raises(MemoryStoreError, match="reserved"):
+            store.create(
+                content="digest",
+                type=MemoryType.SUMMARY,
+                source=src(),
+                key="session:abc123",
+                _allow_summary=True,
+                _source_entry_ids=["a"],
+            )
+
+    def test_similar_but_unreserved_keys_still_work(self, store: MemoryStore) -> None:
+        for key in ("session", "sessions:x", "Session:x", "my-session:x"):
+            entry = create_fact(store, content=f"key {key}", key=key)
+            assert entry.key == key
+
+    def test_prefix_constant_pinned_to_lifecycle(self) -> None:
+        from tulving.context.lifecycle import SESSION_KEY_PREFIX
+        from tulving.store import _RESERVED_SESSION_KEY_PREFIX
+
+        assert _RESERVED_SESSION_KEY_PREFIX == SESSION_KEY_PREFIX
