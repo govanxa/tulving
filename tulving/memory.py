@@ -9,17 +9,22 @@ at startup).
 There is no encryption at rest in v0.1 (ADR-010): do not store secrets you
 cannot afford on disk.
 
-Integration seams (this is build step 9; steps 10-13 land later):
+Component wiring (this is the step-13b integration pass — all four Context
+modules are now live behind Memory):
 
-- ``curator`` / ``summarizer``: ``curate()``/``summarize()`` raise
-  ``NotImplementedError`` until steps 10/12 wire the real components; the
-  curator's ``RetrievalPort`` (``_RetrievalAdapter``) is fully implemented.
-- lifecycle: ``_DefaultLifecycleManager`` implements the blueprint's L1-L7
-  seam minimally (real per-agent session rows; abandonment/staleness are
-  deferred no-ops until step 13).
-- decay: delegated to ``tulving.context.decay`` (build step 11) — the D2
-  formula lives there and only there (D12); ``_EvictionAdapter`` bridges the
-  ``EvictionStore`` protocol onto the store + index tombstoning.
+- ``curator``: ``curate()`` delegates to :class:`ContextCurator`, built
+  lazily over the ``RetrievalPort`` (``_RetrievalAdapter``); the shared
+  token estimator is resolved once per handle (``_get_estimator``).
+- ``summarizer``: ``summarize()`` delegates to :class:`MemorySummarizer`
+  (consuming ``self._llm``; ``llm=None`` degrades loudly there). The same
+  summarizer backs lifecycle end-of-session rollups via a lazy port adapter.
+- ``lifecycle``: the real :class:`LifecycleManager` owns per-agent session
+  rows, abandonment detection (L4), staleness scanning (L5), and session
+  markers. ``record_activity(write=False)`` keeps a read-heavy live session
+  from looking abandoned (search/curate).
+- decay: delegated to ``tulving.context.decay`` — the D2 formula lives there
+  and only there (D12); ``_EvictionAdapter`` bridges the ``EvictionStore``
+  protocol onto the store + index tombstoning.
 """
 
 from __future__ import annotations
@@ -32,7 +37,6 @@ import socket
 import sys
 import threading
 import time
-import uuid
 import warnings
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import suppress
@@ -46,12 +50,19 @@ from tulving.adapters.embeddings import EmbeddingAdapter
 from tulving.adapters.llm import LLMAdapter
 from tulving.adapters.storage import SQLiteBackend, StorageBackend, cloud_sync_risk
 from tulving.context.config import LifecycleConfig
-from tulving.context.curator import ContextCurator, CuratedContext
+from tulving.context.curator import (
+    ContextCurator,
+    CuratedContext,
+    TokenEstimator,
+    resolve_estimator,
+)
 from tulving.context.decay import DecayReport
 from tulving.context.decay import effective_importance as _effective_importance
 from tulving.context.decay import evict as _decay_evict
+from tulving.context.lifecycle import LifecycleManager
+from tulving.context.summarizer import MemorySummarizer
 from tulving.entry import MemoryEntry, Relationship, SourceInfo, utcnow
-from tulving.enums import ArchiveReason, MatchType, MemoryType, SessionStatus
+from tulving.enums import ArchiveReason, MatchType, MemoryType
 from tulving.exceptions import (
     ConfigError,
     MemoryStoreError,
@@ -206,7 +217,8 @@ class CuratorPort(Protocol):
 
 
 class SummarizerPort(Protocol):
-    """Consumed surface of ``MemorySummarizer`` (build step 12)."""
+    """Consumed surface of ``MemorySummarizer`` (the ``Memory(summarizer=...)``
+    injection seam; the default is built lazily in ``_get_summarizer``)."""
 
     def summarize(
         self,
@@ -217,7 +229,14 @@ class SummarizerPort(Protocol):
 
 
 class LifecycleManagerPort(Protocol):
-    """blueprint-memory's L1-L7 lifecycle seam (build step 13)."""
+    """blueprint-memory's L1-L7 lifecycle seam.
+
+    Satisfied structurally by ``tulving.context.lifecycle.LifecycleManager``.
+    ``record_activity`` was added by the step-13b integration pass so the
+    ``activity_debounce_seconds`` knob is exercised in production: read paths
+    (``search``/``curate``) bump ``last_activity_at`` with ``write=False`` so a
+    read-heavy live session never looks abandoned, without write-amplifying.
+    """
 
     def ensure_active_session(self) -> str: ...
     def session_start(self, goal: str | None = None) -> str: ...
@@ -225,6 +244,7 @@ class LifecycleManagerPort(Protocol):
     def check_on_startup(self) -> int: ...
     def run_staleness_scan(self) -> int: ...
     def close_active_session(self) -> None: ...
+    def record_activity(self, session_id: str, *, write: bool = True) -> None: ...
 
 
 # ---------------------------------------------------------------------------
@@ -379,109 +399,27 @@ class _AdvisoryLock:
 
 
 # ---------------------------------------------------------------------------
-# Default lifecycle seam (until context/lifecycle.py — build step 13)
+# Lifecycle end-of-session summarization adapter
 # ---------------------------------------------------------------------------
 
 
-class _DefaultLifecycleManager:
-    """Minimal, deterministic, LLM-free lifecycle seam (blueprint L1-L7).
+class _LifecycleSummarizerAdapter:
+    """``SessionSummarizerPort`` backed by Memory's lazy ``MemorySummarizer``.
 
-    Real per-agent session rows via the backend's session methods; the
-    write-heavy startup duties are deferred no-ops:
-
-    TODO(step 13): replace with ``context.lifecycle.LifecycleManager`` —
-    abandonment detection (L4), staleness scanning (L5), session markers,
-    and end-of-session summarization all land there. Thread safety is
-    provided by ``Memory._session_lock`` around every session mutation.
+    Construction is deferred: the summarizer (and its one-shot token-estimator
+    probe) is built on the FIRST end-of-session rollup via
+    ``Memory._get_summarizer()``, never at handle construction (D8). Wired only
+    when an LLM is configured — with ``llm=None`` the ``LifecycleManager``
+    receives ``summarizer=None`` and degrades loudly on its own (logged
+    warning), so no skip-digest is spawned on every session end.
     """
 
-    def __init__(
-        self,
-        backend: StorageBackend,
-        config: LifecycleConfig,
-        agent_id: str,
-        clock: Callable[[], datetime],
-    ) -> None:
-        self._backend = backend
-        self._config = config
-        self._agent_id = agent_id
-        self._clock = clock
+    def __init__(self, memory: Memory) -> None:
+        self._memory = memory
 
-    def _active_session_id(self) -> str | None:
-        sessions = self._backend.list_sessions(
-            agent_id=self._agent_id, status=SessionStatus.ACTIVE.value
-        )
-        return str(sessions[0]["id"]) if sessions else None
-
-    def _create_session(self, goal: str | None) -> str:
-        now = self._clock().isoformat()
-        session_id = uuid.uuid4().hex
-        self._backend.create_session(
-            {
-                "id": session_id,
-                "agent_id": self._agent_id,
-                "goal": goal,
-                "started_at": now,
-                "last_activity_at": now,
-                "status": SessionStatus.ACTIVE.value,
-            }
-        )
-        return session_id
-
-    def ensure_active_session(self) -> str:
-        """This agent's ACTIVE session id, auto-starting an anonymous one (L2)."""
-        active = self._active_session_id()
-        if active is not None:
-            self._backend.update_session(active, {"last_activity_at": self._clock().isoformat()})
-            return active
-        return self._create_session(goal=None)
-
-    def session_start(self, goal: str | None = None) -> str:
-        """Start a session; refuse when THIS agent already has one (L3, D7)."""
-        if self._active_session_id() is not None:
-            raise MemoryStoreError(f"Session already active for agent '{self._agent_id}'")
-        return self._create_session(goal)
-
-    def session_end(self, session_id: str) -> None:
-        """End an ACTIVE session; summarization is deferred loudly (L3)."""
-        session = self._backend.get_session(session_id)
-        if session is None or session["status"] != SessionStatus.ACTIVE.value:
-            raise MemoryStoreError(f"No active session {session_id!r} to end")
-        if self._config.summarize_on_session_end:
-            logger.warning(
-                "session %s ended without summarization: the summarizer lands at "
-                "build step 12 (deterministic session markers land with lifecycle, "
-                "step 13)",
-                session_id,
-            )
-        now = self._clock().isoformat()
-        self._backend.update_session(
-            session_id,
-            {
-                "status": SessionStatus.ENDED.value,
-                "ended_at": now,
-                "last_activity_at": now,
-            },
-        )
-
-    def check_on_startup(self) -> int:
-        """Abandoned-session detection hook (L4).
-
-        TODO(step 13): per-session ``last_activity_at`` vs
-        ``config.inactivity_threshold``, per-agent correct, never an LLM
-        call. No-op until ``context/lifecycle.py`` lands.
-        """
-        return 0
-
-    def run_staleness_scan(self) -> int:
-        """Staleness-tagging hook (L5). TODO(step 13): no-op until lifecycle."""
-        return 0
-
-    def close_active_session(self) -> None:
-        """Best-effort graceful close used by ``Memory.close()`` (L6)."""
-        active = self._active_session_id()
-        if active is not None:
-            self.session_end(active)
+    def summarize(self, *, session_id: str | None = None) -> list[MemoryEntry]:
+        """Roll up ``session_id``'s memories; return created SUMMARY entries."""
+        return self._memory._get_summarizer().summarize(session_id=session_id)
 
 
 class _SessionContextManager:
@@ -496,6 +434,8 @@ class _SessionContextManager:
     def __enter__(self) -> str:
         with self._memory._session_lock:
             self._session_id = self._memory._lifecycle.session_start(self._goal)
+            # Read paths (search/curate) bump THIS session's activity.
+            self._memory._active_session_id = self._session_id
         return self._session_id
 
     def __exit__(
@@ -509,6 +449,8 @@ class _SessionContextManager:
             try:
                 with self._memory._session_lock:
                     self._memory._lifecycle.session_end(session_id)
+                    if self._memory._active_session_id == session_id:
+                        self._memory._active_session_id = None
             except Exception:
                 if exc_type is None:
                     raise
@@ -615,9 +557,10 @@ class Memory:
                 a read-only handle refuses a nonexistent store).
             agent_id: Identity bound at construction (D7); non-empty.
             embedding_adapter: Optional embedder enabling semantic search.
-            llm_adapter: Optional LLM. Validated and retained on the handle,
-                but INERT until the summarizer lands (build step 12) — no
-                code path calls it yet; None degrades loudly downstream.
+            llm_adapter: Optional LLM. Validated and retained on the handle;
+                consumed by the summarizer (``summarize()`` and end-of-session
+                rollups). ``None`` degrades loudly (warning + visible digest),
+                never silently.
             storage_backend: Injected backend; None opens SQLite in ``path``.
             sensitive_keys: Extra sensitive-key patterns for redaction.
             lifecycle: Policy knobs; None uses ``LifecycleConfig()`` defaults.
@@ -628,10 +571,15 @@ class Memory:
             clock: Injectable now-source (tests never sleep).
             semantic_index: Injection seam for the semantic index (tests /
                 advanced wiring); None builds the default when possible.
-            curator: Injection seam until ContextCurator lands (step 10).
-            summarizer: Injection seam until MemorySummarizer lands (step 12).
-            lifecycle_manager: Injection seam until LifecycleManager lands
-                (step 13); None uses the deterministic default seam.
+            curator: Injection seam for the curator (tests / advanced wiring);
+                None builds a default :class:`ContextCurator` lazily.
+            summarizer: Injection seam for ``summarize()`` (tests / advanced
+                wiring); None builds a default :class:`MemorySummarizer`
+                lazily. Note: end-of-session rollups always use the default
+                summarizer (an injected port need not accept ``session_id``).
+            lifecycle_manager: Injection seam for the lifecycle manager (tests
+                / advanced wiring); None builds the real
+                :class:`LifecycleManager`.
 
         Raises:
             ConfigError: Empty ``agent_id``, structurally invalid adapters,
@@ -699,8 +647,8 @@ class Memory:
             )
             self._config = lifecycle if lifecycle is not None else LifecycleConfig()
             self._key_patterns = compile_key_patterns(sensitive_keys)
-            # CR-M1: retained for the summarizer (build step 12); inert until
-            # then — no code path in this module calls it.
+            # Consumed by the MemorySummarizer (summarize() + end-of-session
+            # rollups). None degrades loudly there — never called elsewhere.
             self._llm = llm_adapter
 
             self._store = MemoryStore(self._backend, clock=clock)
@@ -717,11 +665,30 @@ class Memory:
             self._evaluator = _DecayEvaluator(self._config.half_life_hours)
             self._retrieval = _RetrievalAdapter(self)
             self._curator = curator
+            # Injected summarizer seam (tests / advanced wiring); the default
+            # MemorySummarizer is built lazily+memoized in _get_summarizer (D8:
+            # its token-estimator probe must not run at construction).
             self._summarizer = summarizer
+            self._summarizer_impl: MemorySummarizer | None = None
+            # One token estimator serves the whole handle (curator + summarizer);
+            # resolved lazily so the tiktoken probe never runs at construction.
+            self._estimator: TokenEstimator | None = None
             self._lifecycle: LifecycleManagerPort = (
                 lifecycle_manager
                 if lifecycle_manager is not None
-                else _DefaultLifecycleManager(self._backend, self._config, agent_id, clock)
+                else LifecycleManager(
+                    self._store,
+                    self._backend,
+                    self._config,
+                    agent_id,
+                    # llm=None -> no session-end summarizer wired: the manager
+                    # degrades loudly on its own (never a silent skip, never a
+                    # skip-digest on every session end).
+                    summarizer=(
+                        _LifecycleSummarizerAdapter(self) if self._llm is not None else None
+                    ),
+                    clock=clock,
+                )
             )
         except BaseException:
             if self._lock is not None:
@@ -731,6 +698,15 @@ class Memory:
         self._startup_lock = threading.Lock()
         self._startup_report: StartupReport | None = None
         self._session_lock = threading.Lock()
+        # Dedicated lock for the lazy component builders (_get_estimator/
+        # _get_curator/_get_summarizer). It is always the INNERMOST lock: the
+        # builders acquire no other lock while holding it and resolve the shared
+        # estimator before taking it, so it is safe to acquire while _mutex/
+        # _session_lock are held (end-of-session rollup) without a cycle.
+        self._build_lock = threading.Lock()
+        # Best-known ACTIVE session for read-path activity bumps (search/curate);
+        # set by store()/session() writes, never by a read-only handle.
+        self._active_session_id: str | None = None
         self._closed = False
 
     # ------------------------------------------------------------ properties
@@ -1038,6 +1014,8 @@ class Memory:
         self._require_writable()
         with self._session_lock:
             session_id = self._lifecycle.ensure_active_session()
+            # Remember it so read paths (search/curate) can bump its activity.
+            self._active_session_id = session_id
         entry = self._store.create(
             content=content,
             type=type,
@@ -1138,6 +1116,7 @@ class Memory:
         stripped = query.strip()
         if not stripped:
             return []
+        self._record_read_activity()
         now = self._clock()
 
         candidates: dict[str, tuple[MemoryEntry, float, MatchType]] = {}
@@ -1251,6 +1230,7 @@ class Memory:
         (``LifecycleConfig``), and the compiled sensitive-key patterns.
         """
         self._ensure_started()
+        self._record_read_activity()
         return self._get_curator().curate(
             query,
             token_budget=token_budget,
@@ -1262,18 +1242,75 @@ class Memory:
     def _get_curator(self) -> CuratorPort:
         """The injected curator, or a lazily-built default over the port (D8).
 
-        Lazy so the tiktoken probe never runs at construction; memoized so one
-        curator (and one resolved estimator) serves the handle's lifetime.
+        Lazy so the tiktoken probe never runs at construction; memoized under
+        ``_build_lock`` (double-checked) so one curator — sharing the handle's
+        single estimator — serves the whole lifetime even when curate() and
+        summarize() first-fire concurrently (ADR-015: one process, many
+        threads). The estimator is resolved BEFORE the lock, so ``_build_lock``
+        is never taken re-entrantly.
         """
-        if self._curator is None:
-            self._curator = ContextCurator(
-                self._retrieval,
-                self._evaluator,
-                token_safety_margin=self._config.token_safety_margin,
-                key_patterns=self._key_patterns,
-                now_fn=self._clock,
-            )
-        return self._curator
+        curator = self._curator
+        if curator is None:
+            estimator = self._get_estimator()
+            with self._build_lock:
+                if self._curator is None:
+                    self._curator = ContextCurator(
+                        self._retrieval,
+                        self._evaluator,
+                        token_safety_margin=self._config.token_safety_margin,
+                        key_patterns=self._key_patterns,
+                        estimator=estimator,
+                        now_fn=self._clock,
+                    )
+                curator = self._curator
+        return curator
+
+    def _get_estimator(self) -> TokenEstimator:
+        """The handle's shared token estimator (curator + summarizer), memoized.
+
+        Resolved lazily via :func:`resolve_estimator` (tiktoken -> heuristic)
+        so the one-shot probe never runs at construction (D8); double-checked
+        under ``_build_lock`` so exactly one instance serves the whole handle
+        even under concurrent first-access.
+        """
+        estimator = self._estimator
+        if estimator is None:
+            with self._build_lock:
+                if self._estimator is None:
+                    self._estimator = resolve_estimator()
+                estimator = self._estimator
+        return estimator
+
+    def _get_summarizer(self) -> MemorySummarizer:
+        """The default :class:`MemorySummarizer`, built lazily and memoized (D8).
+
+        Consumes ``self._llm`` (``llm=None`` degrades loudly there), the shared
+        token estimator, the decay-backed importance evaluator, this handle's
+        bound identity (D7), the injected clock, and the compiled sensitive-key
+        patterns (so user-augmented redaction reaches LLM egress, security
+        req #1). Lazy so the estimator probe never runs at construction;
+        double-checked under ``_build_lock``. The estimator is resolved BEFORE
+        the lock (never re-entrant); may run while the lifecycle ``_mutex`` is
+        held (end-of-session rollup) — ``_build_lock`` is always the innermost
+        lock, so no ordering hazard.
+        """
+        summarizer = self._summarizer_impl
+        if summarizer is None:
+            estimator = self._get_estimator()
+            with self._build_lock:
+                if self._summarizer_impl is None:
+                    self._summarizer_impl = MemorySummarizer(
+                        self._store,
+                        self._llm,
+                        self._config,
+                        estimator,
+                        self._evaluator,
+                        self._agent_id,
+                        self._clock,
+                        key_patterns=self._key_patterns,
+                    )
+                summarizer = self._summarizer_impl
+        return summarizer
 
     # -------------------------------------------------------------------- edit
 
@@ -1490,24 +1527,53 @@ class Memory:
     ) -> list[MemoryEntry]:
         """Summarize old memories into SUMMARY digests (call-budgeted).
 
+        Delegates to the injected ``Memory(summarizer=...)`` seam when supplied,
+        otherwise to a default :class:`MemorySummarizer` built lazily over this
+        handle's store, LLM, config, shared token estimator, decay evaluator,
+        bound identity (D7), clock, and sensitive-key patterns.
+
+        With ``llm=None`` the summarizer degrades LOUDLY (a logged warning plus,
+        when candidates exist, one deterministic visible digest) — never
+        silently, never raising.
+
+        Args:
+            older_than: Spare entries accessed within this window
+                (``last_accessed_at`` cutoff) — an entry in active use is
+                never rolled up.
+            tags: Only summarize entries carrying at least one of these tags.
+
+        Returns:
+            The newly created SUMMARY digests (or the single fallback digest
+            when ``llm=None`` and candidates exist; ``[]`` when none exist).
+
         Raises:
-            NotImplementedError: Until MemorySummarizer lands (build step
-                12) — inject via ``Memory(summarizer=...)`` until then.
+            MemoryStoreError: On a read-only handle, or propagated from store
+                writes.
         """
         self._ensure_started()
         self._require_writable()
-        # TODO(step 12): this seam MUST be replaced by real MemorySummarizer
-        # wiring (consuming self._llm) BEFORE mcp/server.py (step 14) is
-        # built — session-end summarization and llm=None loud degradation
-        # depend on it.
-        if self._summarizer is None:
-            raise NotImplementedError(
-                "MemorySummarizer lands at build step 12; inject one via "
-                "Memory(summarizer=...) until then."
-            )
-        return self._summarizer.summarize(older_than=older_than, tags=tags)
+        summarizer = self._summarizer if self._summarizer is not None else self._get_summarizer()
+        return summarizer.summarize(older_than=older_than, tags=tags)
 
     # --------------------------------------------------------------- internals
+
+    def _record_read_activity(self) -> None:
+        """Bump the ACTIVE session's ``last_activity_at`` for a read path.
+
+        Called by ``search()``/``curate()`` with ``write=False`` so a
+        read-heavy live session never looks abandoned, without write-amplifying
+        (the debounce lives in ``LifecycleManager.record_activity``). No-op on a
+        read-only handle (never writes, D-read_only) and when no session is
+        active — a pure read never starts a session. Best-effort: a stale
+        cached id is a safe no-op in ``record_activity`` (ownership/ACTIVE
+        guard), so failures here never break the read.
+        """
+        if self._read_only:
+            return
+        session_id = self._active_session_id
+        if session_id is None:
+            return
+        self._lifecycle.record_activity(session_id, write=False)
 
     def _ensure_started(self) -> None:
         """Lazy startup trigger — every public method calls this first."""
