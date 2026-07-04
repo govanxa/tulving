@@ -2060,3 +2060,67 @@ class TestLockFileNotUnlinked:
         second = Memory(path=str(path), agent_id="b")
         second.close()
         assert (path / "tulving.lock").exists()
+
+
+# ---------------------------------------------------------------------------
+# JSON export/import conveniences (build step 15; the reconcile bridge)
+# ---------------------------------------------------------------------------
+
+
+class TestJsonExportImport:
+    """T1: Memory.export_json/import_json end-to-end, incl. the reconcile step
+    that makes imported vectors (persisted as BLOBs by restore) searchable."""
+
+    def test_import_json_makes_entries_searchable(
+        self, tmp_path: Path, fake_clock: FakeClock
+    ) -> None:
+        src = make_memory(tmp_path, fake_clock, subdir="src", embedding_adapter=HashEmbedder(32))
+        try:
+            src.store("the unique importable memory text", type=MemoryType.FACT)
+            dump = tmp_path / "dump.json"
+            src.export_json(str(dump), allowed_root=tmp_path)
+        finally:
+            src.close()
+
+        dest = make_memory(tmp_path, fake_clock, subdir="dest", embedding_adapter=HashEmbedder(32))
+        try:
+            report = dest.import_json(str(dump))
+            assert report.entries_imported >= 1
+            # End-to-end: reconcile indexed the imported BLOB, so semantic
+            # search returns the imported entry (not just BLOB presence).
+            hits = dest.search("the unique importable memory text")
+            assert any(h.entry.content == "the unique importable memory text" for h in hits)
+        finally:
+            dest.close()
+
+    def test_import_json_reconcile_failure_is_non_fatal(
+        self, tmp_path: Path, fake_clock: FakeClock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        src = make_memory(tmp_path, fake_clock, subdir="src2", embedding_adapter=HashEmbedder(32))
+        try:
+            src.store("importable text two", type=MemoryType.FACT)
+            dump = tmp_path / "dump2.json"
+            src.export_json(str(dump), allowed_root=tmp_path)
+        finally:
+            src.close()
+
+        fake = FakeSemanticIndex()
+
+        def boom() -> Any:
+            raise VectorIndexError("reconcile exploded")
+
+        monkeypatch.setattr(fake, "reconcile", boom)
+        dest = make_memory(
+            tmp_path,
+            fake_clock,
+            subdir="dest2",
+            semantic=fake,
+            embedding_adapter=HashEmbedder(32),
+        )
+        try:
+            # A post-import reconcile failure is logged, never fatal (ADR-015);
+            # the report is still returned.
+            report = dest.import_json(str(dump))
+            assert report.entries_imported >= 1
+        finally:
+            dest.close()

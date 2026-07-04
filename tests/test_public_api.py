@@ -17,6 +17,10 @@ EXPECTED_EXPORTS = {
     "LifecycleConfig",
     # curation (build step 10; headline primitive's return type)
     "CuratedContext",
+    # JSON export/import (build step 15)
+    "ImportReport",
+    "MemoryExporter",
+    "MemoryImporter",
     # enums
     "ArchiveReason",
     "MatchType",
