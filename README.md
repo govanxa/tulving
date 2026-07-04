@@ -25,4 +25,4 @@ By the same author: [Kairos](https://github.com/govanxa/kairos) (`kairos-ai`) â€
 
 ## License
 
-TBD (MIT or Apache 2.0) â€” will be finalized with the v0.1 release.
+[Apache 2.0](LICENSE)
