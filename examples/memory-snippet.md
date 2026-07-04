@@ -1,4 +1,4 @@
-# CLAUDE.md memory snippet
+# Memory snippet
 
 Paste one of the blocks below into a project's `CLAUDE.md` (or an LM Studio system prompt) so
 the agent uses Tulving's memory tools consistently. Pick the block that matches how you set up

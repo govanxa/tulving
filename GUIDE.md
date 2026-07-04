@@ -308,7 +308,7 @@ short Python script. Only one writable server may hold the global path at a time
 that single knowledge-base session — every other project reads the result (picking up new entries
 the next time its read-only session starts). Make the distinction explicit in each project's
 `CLAUDE.md`; ready-to-paste blocks for all three setups are in
-[`examples/claude-md-memory-snippet.md`](examples/claude-md-memory-snippet.md).
+[`examples/memory-snippet.md`](examples/memory-snippet.md).
 
 > Prefer writing shared knowledge on demand from *any* session? Then make the shared server
 > **writable** instead of read-only — but only one Claude Code instance can hold it at a time, so
