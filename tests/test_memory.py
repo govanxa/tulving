@@ -1771,6 +1771,32 @@ class TestHostileLockDiagnostics:
         finally:
             holder.close()
 
+    def test_short_hostile_payload_still_field_validated(self, tmp_path: Path) -> None:
+        """QA (SEC-SEV-001 depth): a payload SMALL enough to survive the 2 KB
+        bounded read and parse as JSON must still have every field validated —
+        implausible pid discarded, ANSI-laced timestamp rejected. Guards the
+        per-field layer, which the oversize payload above never reaches."""
+        path = tmp_path / "locked"
+        holder = Memory(path=str(path), agent_id="a")
+        try:
+            hostile = json.dumps(
+                {
+                    "pid": 99999999999999999,  # > 2**32 — implausible, discard
+                    "acquired_at": "\x1b[31m2026-01-01T00:00:00\x1b[0m",
+                }
+            )
+            (path / "tulving.lock").write_text(hostile, encoding="utf-8")
+            with pytest.raises(StorageError) as excinfo:
+                Memory(path=str(path), agent_id="b")
+            message = str(excinfo.value)
+            assert "99999999999999999" not in message
+            assert "\x1b" not in message
+            assert all(ch.isprintable() for ch in message)
+            assert "since" not in message  # ANSI-laced timestamp fails validation
+            assert "read_only" in message  # remedy survives
+        finally:
+            holder.close()
+
 
 class TestLockFileNotUnlinked:
     """DB-M2: release() never unlinks (unlink-on-release is a POSIX TOCTOU)."""
