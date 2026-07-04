@@ -15,6 +15,8 @@ EXPECTED_EXPORTS = {
     "SearchResult",
     "StartupReport",
     "LifecycleConfig",
+    # curation (build step 10; headline primitive's return type)
+    "CuratedContext",
     # enums
     "ArchiveReason",
     "MatchType",

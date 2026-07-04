@@ -926,9 +926,14 @@ class TestUpdate:
 
 
 class TestCurateSeam:
-    def test_curate_without_curator_raises(self, memory: Memory) -> None:
-        with pytest.raises(NotImplementedError, match=r"[Cc]urator"):
-            memory.curate("query")
+    def test_curate_uses_default_curator_when_none_injected(self, memory: Memory) -> None:
+        # Step 10 wired a default ContextCurator over Memory's RetrievalPort:
+        # curate() no longer raises NotImplementedError. Empty store ⇒ a valid
+        # header-only CuratedContext.
+        result = memory.curate("query")
+        assert result.entries == []
+        assert result.sources_consulted == 0
+        assert "0 entries" in result.content
 
     def test_curate_delegates_to_injected_curator(
         self, tmp_path: Path, fake_clock: FakeClock
