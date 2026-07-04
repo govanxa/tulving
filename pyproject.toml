@@ -40,10 +40,14 @@ openai = [
 ]
 mcp = [
     "mcp>=1.0",
+    "anyio>=4",
 ]
 anthropic = [
     "anthropic>=0.40",
 ]
+
+[project.scripts]
+tulving-mcp = "tulving.mcp.server:main"
 
 [project.urls]
 Author = "https://github.com/govanxa"
