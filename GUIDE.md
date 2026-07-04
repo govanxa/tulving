@@ -530,6 +530,53 @@ advisory locking are unreliable there, and Tulving emits a warning when it detec
 secret-shaped tokens on emission surfaces (curated context, MCP responses, exports), but do not
 rely on it to store credentials you cannot afford on disk.
 
+### Inspecting the store
+
+Everything is a plain SQLite database, so you can browse it with **DB Browser for SQLite**,
+**JetBrains DataGrip**, or the `sqlite3` CLI. Open the file at `<your --memory-path>/tulving.db`:
+
+- **DB Browser for SQLite:** *File → Open Database Read Only* → `tulving.db`.
+- **DataGrip:** *New → Data Source → SQLite* → point at `tulving.db` (the SQLite driver is bundled;
+  enable read-only in the options).
+- **CLI:** `sqlite3 tulving.db` then `.tables`.
+
+Files in the memory directory:
+
+| File | What it is |
+|---|---|
+| `tulving.db` | the SQLite database — **open this** |
+| `tulving.db-wal` / `-shm` | WAL sidecars; present only while Tulving is running (a DB tool reads them via `tulving.db` automatically) |
+| `tulving.hnsw` | the vector index (a binary hnswlib cache, not SQLite) |
+| `tulving.lock` | Tulving's advisory writer lock |
+
+Tables: `memories`, `memory_tags` (`entry_id`, `tag`), `sessions`, `meta` (`schema_version`,
+`embedding_model_id`, `dimension`, `distance_metric`), and `vector_labels` (the int-label↔UUID map
+for the vector index). Two queries to start:
+
+```sql
+-- live memories (superseded/forgotten rows linger with archived = 1)
+SELECT key, type, base_importance, tags, created_at
+FROM memories WHERE archived = 0;
+
+-- normalized tags
+SELECT m.key, t.tag
+FROM memories m JOIN memory_tags t ON t.entry_id = m.id
+WHERE m.archived = 0;
+```
+
+Three things to keep in mind:
+
+1. **Inspect read-only; do not edit while Tulving is running.** The `tulving.lock` file coordinates
+   only other *Tulving* processes — an external DB tool ignores it. Reading concurrently is safe
+   (WAL allows readers), but editing rows from outside can violate invariants and desync the
+   `tulving.hnsw` index. If you must edit, do it with Tulving stopped, then **delete `tulving.hnsw`**
+   so Tulving rebuilds it from the embedding BLOBs on the next `startup()` (the index is a
+   rebuildable cache — the SQLite BLOBs are the source of truth).
+2. The `embedding` column is a packed float32 **BLOB** — not human-readable; ignore it.
+3. Only `base_importance` is stored; the effective (decayed) importance is computed lazily on read,
+   so it does not appear in any column. Note `UNIQUE(key) WHERE archived = 0` — one live entry per
+   key, with older copies kept as `archived = 1`.
+
 ---
 
 ## 8. Running the test suite
