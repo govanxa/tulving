@@ -2,8 +2,8 @@
 
 > *The context-budget engine for AI agents.*
 
-**Status: v0.1.1 released on PyPI.** `pip install tulving` installs the current stable release.
-v0.2 is in development — see the [roadmap](#roadmap--coming-in-v02).
+**Status: stable on PyPI.** `pip install tulving` installs the current release. v0.2 is in
+development — see the [roadmap](#roadmap--coming-in-v02).
 
 Tulving is a model-agnostic Python SDK that gives an AI agent persistent, structured,
 searchable working memory — and, as its **headline capability**, curates that memory back
