@@ -1,0 +1,63 @@
+name: CI
+
+# Test, type-check, and lint on every push/PR to the working and release branches.
+# Release/publish lives in a separate workflow (publish.yml); this one never touches PyPI.
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+    branches: [dev, main]
+
+# Cancel superseded runs on the same ref (save CI minutes on rapid pushes).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Platform-independent gates run once (fast feedback, no matrix cost).
+  quality:
+    name: lint + type-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install (core + dev + mcp)
+        run: python -m pip install --upgrade pip && pip install -e ".[dev,mcp]"
+      - name: Ruff lint
+        run: ruff check tulving/ tests/
+      - name: Ruff format check
+        run: ruff format --check tulving/ tests/
+      - name: Mypy (strict)
+        run: mypy tulving/
+
+  # The test suite runs on every supported interpreter and on both the
+  # developer's platform (Windows) and the CI-standard Linux, because SQLite
+  # WAL, advisory file locking, and path handling are platform-sensitive
+  # (ADR-015). Core deps only + [dev,mcp]; no [local]/torch (tests use the
+  # zero-dep HashEmbedder and mock all network adapters).
+  test:
+    name: test (py${{ matrix.python-version }} / ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install (core + dev + mcp)
+        run: python -m pip install --upgrade pip && pip install -e ".[dev,mcp]"
+      - name: Pytest (with coverage)
+        run: pytest --cov=tulving --cov-report=term-missing

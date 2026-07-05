@@ -4,9 +4,61 @@ Persistent, typed, searchable working memory for a single AI agent, with
 token-budget context curation (``curate(query, token_budget)``) as the
 headline primitive. Named after Endel Tulving, the psychologist who
 established that memory has types.
-
-This is a name-holding pre-release (0.0.1). The v0.1 implementation is in
-active development.
 """
 
-__version__ = "0.0.1"
+from tulving.adapters.embeddings import (
+    EmbeddingAdapter,
+    HashEmbedder,
+    LocalEmbedder,
+    OpenAIEmbedder,
+)
+from tulving.context.config import LifecycleConfig
+from tulving.context.curator import CuratedContext
+from tulving.context.lifecycle import Session, SessionSummary
+from tulving.entry import MemoryEntry, Relationship, SourceInfo
+from tulving.enums import ArchiveReason, MatchType, MemoryType, SessionStatus
+from tulving.exceptions import (
+    ConfigError,
+    MemoryStoreError,
+    ScopeError,
+    SecurityError,
+    StorageError,
+    TulvingError,
+    VectorIndexError,
+)
+from tulving.export import ImportReport, MemoryExporter, MemoryImporter
+from tulving.memory import Memory, SearchResult, StartupReport
+
+__version__ = "0.1.0"
+
+__all__ = [
+    "ArchiveReason",
+    "ConfigError",
+    "CuratedContext",
+    "EmbeddingAdapter",
+    "HashEmbedder",
+    "ImportReport",
+    "LifecycleConfig",
+    "LocalEmbedder",
+    "MatchType",
+    "Memory",
+    "MemoryEntry",
+    "MemoryExporter",
+    "MemoryImporter",
+    "MemoryStoreError",
+    "MemoryType",
+    "OpenAIEmbedder",
+    "Relationship",
+    "ScopeError",
+    "SearchResult",
+    "SecurityError",
+    "Session",
+    "SessionStatus",
+    "SessionSummary",
+    "SourceInfo",
+    "StartupReport",
+    "StorageError",
+    "TulvingError",
+    "VectorIndexError",
+    "__version__",
+]
