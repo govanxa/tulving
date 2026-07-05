@@ -29,7 +29,7 @@ from tulving.exceptions import (
 from tulving.export import ImportReport, MemoryExporter, MemoryImporter
 from tulving.memory import Memory, SearchResult, StartupReport
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 __all__ = [
     "ArchiveReason",

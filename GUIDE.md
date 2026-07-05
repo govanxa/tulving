@@ -33,7 +33,7 @@ pip install tulving                 # core engine (standard library + hnswlib)
 Optional extras:
 
 ```bash
-pip install "tulving[local]"        # fully-offline embeddings (sentence-transformers)
+pip install "tulving[local]"        # fully-offline embeddings (sentence-transformers + torch, several hundred MB)
 pip install "tulving[openai]"       # OpenAI embeddings
 pip install "tulving[anthropic]"    # Claude LLM for session summaries
 pip install "tulving[mcp]"          # the MCP server (Claude Code, LM Studio, etc.)
@@ -127,9 +127,27 @@ Tulving ships a thin, **local-only** (stdio, no network) MCP server exposing six
 `memory_store`, `memory_get`, `memory_search`, `memory_curate`, `memory_forget`,
 `memory_list_keys` (orient = `memory_curate(mode="orient")`).
 
-> The server's `--embedding` choices are `local` and `openai` (there is no zero-dependency
-> embedder over MCP), so install `[mcp,local]` for a fully offline setup, or use
-> `--embedding openai` with `OPENAI_API_KEY`.
+> **The MCP server requires an embedder to start** — `--embedding local` or `--embedding openai`
+> (it defaults to `local`; there is **no** torch-free / zero-dependency embedder over MCP in v0.1):
+> - **`--embedding local`** — fully offline, but installs `sentence-transformers` **+ `torch`
+>   (several hundred MB)**. This is what local-LLM / LM Studio users want:
+>   `pip install "tulving[mcp,local]"`.
+> - **`--embedding openai`** — avoids torch, but sends your memory text to OpenAI to compute
+>   embeddings (**not offline**; needs `OPENAI_API_KEY` + network):
+>   `pip install "tulving[mcp,openai]"`.
+>
+> **This is independent of the MCP host.** Claude Code and LM Studio are both just *hosts* — they
+> spawn the server and let their model call the tools; neither supplies embeddings. So the same
+> choice, and the same torch requirement for an offline setup, applies to **both**. There is **no
+> Anthropic/Claude embedder**, and `--llm claude` powers Tulving's *own* summaries (not
+> embeddings) — it does **not** remove the torch requirement.
+
+> **Coming in v0.2 — torch-free MCP.** If all you want is `curate`'s token-budget reduction and you
+> don't need semantic search (find-by-meaning), note that v0.1 still forces a `local` (torch) or
+> `openai` embedder just to *start* the server. v0.2 will add an **embedder-free mode**
+> (`--embedding none`) — exact-key + importance/recency curation with **no torch and no network** —
+> the right fit for token-reduction-only users on LM Studio or Claude Code. Until then, use
+> `[mcp,local]` (offline, torch) or `[mcp,openai]` (cloud, no torch).
 
 #### Do I have to tell the model "remember this" every time?
 
@@ -166,8 +184,10 @@ gate every write yourself.
 - **LM Studio** with a **tool-calling-capable** model loaded (e.g. a Qwen2.5-Instruct or
   Llama-3.1-Instruct "tools"/"function-calling" model — a model without tool support cannot
   call MCP tools).
-- `pip install "tulving[mcp,local]"` (fully offline; downloads a small embedding model on first
-  run).
+- `pip install "tulving[mcp,local]"`. The MCP server needs an embedder; `[local]` runs fully
+  offline but installs `sentence-transformers` **+ `torch` (several hundred MB)** and downloads a
+  ~90 MB embedding model on first run. (To avoid torch, use `--embedding openai` instead — cloud,
+  needs a key; see §4.)
 
 **Wire Tulving in.** LM Studio is an MCP host: it launches MCP servers and lets the loaded model
 call their tools. Add Tulving to its MCP config (in the app, edit `mcp.json`; LM Studio uses the
