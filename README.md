@@ -200,7 +200,9 @@ behavior verification, and how to measure Tulving against having no memory at al
 ---
 
 By the same author: [Kairos](https://github.com/govanxa/kairos) (`kairos-ai`) —
-contract-enforced AI workflows. A `kairos-ai-tulving` integration plugin is planned.
+contract-enforced AI workflows — and its
+[`kairos-ai-evidence`](https://pypi.org/project/kairos-ai-evidence/) plugin for
+contract-validated evidence evaluation. A `kairos-ai-tulving` integration plugin is planned.
 
 ## License
 
