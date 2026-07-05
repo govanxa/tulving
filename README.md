@@ -172,8 +172,24 @@ IDs/reference graph are consistently remapped.
 - **Adapters & export** — pluggable embeddings (`local`/`openai`) and LLM (`anthropic`);
   JSON round-trip export/import with default-on redaction.
 
-Deferred to later versions (see `docs/adrs/adr-016`): knowledge graph, multi-agent
-machinery, semantic contradiction detection, Postgres backend, and additional export formats.
+---
+
+## Roadmap — coming in v0.2
+
+Planned for the next release (**not yet available**):
+
+- **`tulving eval` — a value report.** Measure whether Tulving is actually helping *your* store over
+  time: how much `curate()` cuts context-token usage as your memory grows, plus answer correctness —
+  rendered as a self-contained **HTML / PDF trend report**.
+- **Torch-free offline MCP mode (`--embedding none`).** Run the MCP server with **no torch and no
+  network** — key-exact recall + importance/recency curation — for users who want token-budget
+  reduction without installing the local-embeddings stack. (Semantic "search by meaning" stays
+  available via `--embedding local` / `openai`.)
+- **`tulving maintenance` — housekeeping CLI.** `--inspect` / `--purge` / `--vacuum` / `--export`
+  to keep a long-lived store tidy on disk.
+
+Further out (ADR-016): knowledge graph, multi-agent machinery, semantic contradiction detection,
+Postgres backend, and additional export formats.
 
 ---
 
