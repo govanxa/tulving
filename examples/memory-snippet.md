@@ -4,6 +4,17 @@ Paste one of the blocks below into a project's `CLAUDE.md` (or an LM Studio syst
 the agent uses Tulving's memory tools consistently. Pick the block that matches how you set up
 the MCP server (see [`GUIDE.md` §4d](../GUIDE.md#4d-global-vs-per-project-memory-and-tagging)).
 
+Each block sets **two standing policies** so the model runs the memory loop on its own — you never
+have to say "remember this" per message (see [`GUIDE.md` §4](../GUIDE.md#4-using-tulving-over-mcp),
+"Do I have to tell the model 'remember this' every time?"):
+
+- a **recall policy** — *at the start of a task*, call `memory_curate` (or `mode="orient"`) to pull
+  relevant context back into the prompt; and
+- a **storage policy** — *when the user states something durable*, call `memory_store` with a
+  `type`, a stable `key`, and `tags`; never store secrets or throwaway chatter.
+
+Keep both — recall without storage has nothing to load; storage without recall never gets used.
+
 ---
 
 ## 1. Basic — one store (per-project or a single global store)
