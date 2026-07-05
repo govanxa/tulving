@@ -140,8 +140,14 @@ Tulving ships a thin, **local-only** (stdio, no network) MCP server exposing six
 > spawn the server and let their model call the tools; neither supplies embeddings. So the same
 > choice, and the same torch requirement for an offline setup, applies to **both**. There is **no
 > Anthropic/Claude embedder**, and `--llm claude` powers Tulving's *own* summaries (not
-> embeddings) — it does **not** remove the torch requirement. (A torch-free offline MCP mode is
-> planned for v0.2.)
+> embeddings) — it does **not** remove the torch requirement.
+
+> **Coming in v0.2 — torch-free MCP.** If all you want is `curate`'s token-budget reduction and you
+> don't need semantic search (find-by-meaning), note that v0.1 still forces a `local` (torch) or
+> `openai` embedder just to *start* the server. v0.2 will add an **embedder-free mode**
+> (`--embedding none`) — exact-key + importance/recency curation with **no torch and no network** —
+> the right fit for token-reduction-only users on LM Studio or Claude Code. Until then, use
+> `[mcp,local]` (offline, torch) or `[mcp,openai]` (cloud, no torch).
 
 #### Do I have to tell the model "remember this" every time?
 
