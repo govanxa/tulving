@@ -577,6 +577,56 @@ Three things to keep in mind:
    so it does not appear in any column. Note `UNIQUE(key) WHERE archived = 0` — one live entry per
    key, with older copies kept as `archived = 1`.
 
+### Maintenance & housekeeping — what a growing store needs
+
+The design deliberately decouples **store size** from **prompt cost**, so for everyday use there
+is almost nothing to maintain. The one thing that grows is the SQLite file on disk, and there's a
+reclaim path for it.
+
+**Automatic — you do nothing:**
+
+- **Curation is token-budget-bounded.** `curate(query, token_budget)` returns the same-sized block
+  whether the store holds 50 memories or 50,000 — what you feed the model never grows with the
+  store (see [§6](#6-measuring-the-value-vs-no-memory)). This is the point of the whole design.
+- **Lazy decay** demotes unused entries on read (`base * 0.5^(age / half_life)`); `DECISION` and
+  pinned entries never decay, so stale notes sink below the recall cut on their own.
+- **Eviction runs on every `startup()`** — each time the MCP server boots (i.e. each session), a
+  time-boxed pass *archives* entries whose effective importance fell below the eviction threshold
+  (pinned/`DECISION` are exempt). It only moves rows out of the active set; it never deletes.
+- **WAL and the vector index self-manage:** the WAL is checkpoint-truncated on clean shutdown, and
+  `tulving.hnsw` uses tombstone-and-rebuild compaction (and is rebuildable from the BLOBs anyway).
+
+**Manual — only when the DB file itself gets large.** Tulving *archives, never destroys* (D2):
+every supersede, forget, and eviction leaves an `archived = 1` row behind, so `tulving.db` grows
+with your total write history even though the active set stays lean. For a per-project store this
+is slow (tens of MB over a long time, not runaway). When you want to reclaim it — with Tulving
+**stopped** (single-writer rule), from the SDK:
+
+```python
+from datetime import timedelta
+from tulving import Memory
+
+m = Memory("/path/to/agent_memory", agent_id="dev")
+m.startup()
+
+m.export_json("backup.json", allowed_root=".",              # 1. safety backup first
+              include_archived=True, include_sensitive=True)
+purged = m.purge_archived(older_than=timedelta(days=90))    # 2. drop old archived rows
+print(f"purged {purged} archived rows")
+m.close()                                                   # checkpoints the WAL
+# 3. reclaim file size:  sqlite3 /path/to/agent_memory/tulving.db "VACUUM;"
+```
+
+`purge_archived` is reason-aware: it **refuses to delete summarization-source entries** unless you
+name that reason explicitly, so compressing sessions into summaries never silently loses the
+sources. `DECISION`/pinned entries are never eviction targets in the first place, so a purge of
+archived rows can't remove a live decision.
+
+> **v0.1 gap:** purge and vacuum are **SDK-only** — there is no MCP tool or `tulving-mcp` flag for
+> them yet, so housekeeping means a short Python script or a scheduled job as above. A maintenance
+> CLI (`tulving-mcp --inspect` / `--purge` / `--vacuum`) is planned for a later release; day to day,
+> a per-project store rarely needs any of this.
+
 ---
 
 ## 8. Running the test suite
