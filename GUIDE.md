@@ -192,11 +192,16 @@ the six tools.
 ```
 You have a persistent memory via the `tulving` tools. Use it:
 - When the user states a durable fact, decision, or plan, call memory_store
-  (type = fact | decision | observation | plan; add a key like "decision:auth").
+  (type = fact | decision | observation | plan; add a key like
+  "decision:api-scheme" or "fact:session-ttl").
 - At the START of a task, call memory_curate with the task description and a
   token_budget (e.g. 1500) to reload relevant context, or memory_curate with
   mode="orient" for a cold-start briefing.
 - Prefer memory_get for an exact key you know; memory_search to find by meaning.
+- Do NOT put the words auth, token, secret, password, key, or credential in a
+  key unless the value really is a secret — Tulving masks the whole content of
+  a key that looks like it names one. Use neutral keys (e.g. "decision:login-flow",
+  not "decision:auth"; "fact:session-ttl", not "fact:auth-ttl").
 ```
 
 **Prove persistence with two chats.** In chat 1: "We decided to use SQLite over Postgres for
@@ -248,15 +253,23 @@ sequence with exact arguments and the exact responses Tulving returns:
 
 | Step | Tool | Arguments | Response |
 |---|---|---|---|
-| 1 | `memory_store` | `{"content":"Chose JWT (RS256) over sessions.","type":"decision","key":"decision:auth","tags":["auth"]}` | `Stored memory <uuid> with key 'decision:auth'` |
-| 2 | `memory_store` | `{"content":"Auth token TTL is 15 minutes.","type":"fact","key":"fact:ttl","tags":["auth"]}` | `Stored memory <uuid> with key 'fact:ttl'` |
-| 3 | `memory_list_keys` | `{"prefix":"decision:"}` | `decision:auth` |
-| 4 | `memory_get` | `{"key":"decision:auth"}` | a block: `[decision] decision:auth` / `id: …` / `tags: auth` / `importance: 0.50` / `created: …` / `---` / `Chose JWT (RS256) over sessions.` |
-| 5 | `memory_search` | `{"query":"how does auth work","top_k":5}` | numbered lines like `1. [0.87 semantic \| decision \| decision:auth] Chose JWT…` |
+| 1 | `memory_store` | `{"content":"Chose JWT (RS256) over sessions.","type":"decision","key":"decision:api-scheme","tags":["auth"]}` | `Stored memory <uuid> with key 'decision:api-scheme'` |
+| 2 | `memory_store` | `{"content":"Session tokens live for 15 minutes.","type":"fact","key":"fact:session-ttl","tags":["auth"]}` | `Stored memory <uuid> with key 'fact:session-ttl'` |
+| 3 | `memory_list_keys` | `{"prefix":"decision:"}` | `decision:api-scheme` |
+| 4 | `memory_get` | `{"key":"decision:api-scheme"}` | a block: `[decision] decision:api-scheme` / `id: …` / `tags: auth` / `importance: 0.50` / `created: …` / `---` / `Chose JWT (RS256) over sessions.` |
+| 5 | `memory_search` | `{"query":"how does auth work","top_k":5}` | numbered lines like `1. [0.87 semantic \| decision \| decision:api-scheme] Chose JWT…` |
 | 6 | `memory_curate` | `{"query":"resuming the auth work","token_budget":800}` | prompt-ready text + footer `--- [tokens: N, budget remaining: M, sources consulted: K]` |
 | 7 | `memory_curate` | `{"query":"","mode":"orient","token_budget":600}` | a cold-start briefing (Key Decisions, session history); with `--llm none`, ends with a "no LLM adapter configured" note |
-| 8 | `memory_forget` | `{"key":"fact:ttl"}` | `Archived memory with key 'fact:ttl'` |
-| 9 | `memory_get` | `{"key":"fact:ttl"}` | `No memory found for key 'fact:ttl'.` (archived ≠ retrievable) |
+| 8 | `memory_forget` | `{"key":"fact:session-ttl"}` | `Archived memory with key 'fact:session-ttl'` |
+| 9 | `memory_get` | `{"key":"fact:session-ttl"}` | `No memory found for key 'fact:session-ttl'.` (archived ≠ retrievable) |
+
+> **Watch your key names.** The keys above deliberately avoid the words `auth`, `token`, `secret`,
+> `password`, `key`, and `credential`. Tulving treats a key containing any of those as naming a
+> secret and **masks the whole content as `[REDACTED]`** on every emission surface (get, curate,
+> export) — a safety default, but a surprise if you keyed a non-secret `fact:auth-ttl`. Use neutral
+> keys (`fact:session-ttl`, `decision:api-scheme`, `decision:login-flow`) for ordinary memories;
+> the content itself is never redacted for containing the word "auth", only the *key* matters. This
+> is a known sharp edge slated for softening in v0.2.
 
 What each tool is for:
 
@@ -355,13 +368,17 @@ one** of the listed tags (and `exclude_tags` always wins).
 ```jsonc
 // MCP: memory_store arguments
 { "content": "Chose JWT (RS256) for auth.", "type": "decision",
-  "key": "projA:decision:auth", "tags": ["projA", "auth"] }
+  "key": "projA:decision:api-scheme", "tags": ["projA", "auth"] }
 ```
 ```python
 # Python
 memory.store("Chose JWT (RS256) for auth.", type=MemoryType.DECISION,
-             key="projA:decision:auth", tags=["projA", "auth"])
+             key="projA:decision:api-scheme", tags=["projA", "auth"])
 ```
+
+(Note the key is `decision:api-scheme`, not `decision:auth` — a key containing `auth`/`token`/
+`secret`/`password`/`key`/`credential` gets its content masked as `[REDACTED]`. Tags are never
+redacted, so `tags: ["auth"]` is fine.)
 
 **Filter by tags / prefix when recalling:**
 
@@ -377,9 +394,11 @@ memory.store("Chose JWT (RS256) for auth.", type=MemoryType.DECISION,
 ```
 When you store a memory, tag it with the project name (e.g. "projA") plus topic
 tags (e.g. "auth", "billing"), and prefix its key with the project, like
-"projA:decision:auth". Tag anything true across projects with "shared". When
-recalling, call memory_curate with include_tags=["<project>", "shared"] so you
-get both this project's memory and universal knowledge in one call.
+"projA:decision:api-scheme". Do NOT put auth/token/secret/password/key/credential
+in a key (Tulving masks such keys); keep keys neutral. Tag anything true across
+projects with "shared". When recalling, call memory_curate with
+include_tags=["<project>", "shared"] so you get both this project's memory and
+universal knowledge in one call.
 ```
 
 That last convention is the tidy answer to sharing without mixing: keep a `shared` tag for
@@ -444,8 +463,8 @@ toks = lambda s: est.estimate(s)
 
 SEED = [
     ("Chose SQLite (WAL) over Postgres for zero-infra local deploy.", MemoryType.DECISION, "decision:datastore", ["arch","db"], 0.9),
-    ("Chose JWT (RS256) over sessions for the auth layer.", MemoryType.DECISION, "decision:auth", ["auth"], 0.85),
-    ("Auth tokens expire after 15 minutes; refresh after 7 days.", MemoryType.FACT, "fact:auth-ttl", ["auth"], 0.7),
+    ("Chose JWT (RS256) over sessions for the auth layer.", MemoryType.DECISION, "decision:api-scheme", ["auth"], 0.85),
+    ("Auth tokens expire after 15 minutes; refresh after 7 days.", MemoryType.FACT, "fact:session-ttl", ["auth"], 0.7),
     ("Chose Stripe over Paddle for billing (better API, EU support).", MemoryType.DECISION, "decision:billing", ["billing"], 0.8),
     ("Rate limit: 100 req/min per API key, 429 on exceed.", MemoryType.FACT, "fact:rate-limit", ["api"], 0.6),
 ]
@@ -500,7 +519,7 @@ def ask(context, question):
 d = os.path.join(tempfile.mkdtemp(), "proj")
 m = Memory(d, agent_id="dev", embedding_adapter=HashEmbedder())
 SEED = [
-    ("Chose JWT (RS256) over sessions for the auth layer.", MemoryType.DECISION, "decision:auth", ["auth"], 0.85),
+    ("Chose JWT (RS256) over sessions for the auth layer.", MemoryType.DECISION, "decision:api-scheme", ["auth"], 0.85),
     ("Auth tokens expire after 15 minutes.", MemoryType.FACT, "fact:ttl", ["auth"], 0.7),
     ("Chose Stripe over Paddle for billing.", MemoryType.DECISION, "decision:billing", ["billing"], 0.8),
 ]
