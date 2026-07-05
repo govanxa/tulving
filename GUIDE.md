@@ -131,6 +131,35 @@ Tulving ships a thin, **local-only** (stdio, no network) MCP server exposing six
 > embedder over MCP), so install `[mcp,local]` for a fully offline setup, or use
 > `--embedding openai` with `OPENAI_API_KEY`.
 
+#### Do I have to tell the model "remember this" every time?
+
+**No — you tell it once, as a policy, not per message.** Tulving is a passive tool provider: it
+exposes the six tools and does nothing until the model calls one. There is no background process
+watching the chat and auto-capturing "important" things (that machinery is deferred, ADR-016). So
+whether a model stores autonomously is entirely a function of its **instructions**, not a Tulving
+setting:
+
+- **With no instruction**, a model rarely stores unprompted — you'd have to say "remember this"
+  each time.
+- **With a standing storage policy** in the system prompt (LM Studio) or `CLAUDE.md` (Claude Code),
+  the model decides *what* is durable and stores it on its own — choosing a sensible `type`, `key`,
+  and `tags` — without you narrating each save.
+- **Explicit "remember this"** always works as a 100%-reliable override on top of either.
+
+Give it **two** standing instructions and it runs the whole loop hands-off: a *storage* policy
+("store durable decisions/facts/plans as they arise; skip chatter and secrets") and a *recall*
+policy ("at the start of a task, call `memory_curate`, or `mode="orient"`, to reload context").
+Ready-to-paste blocks are in [`examples/memory-snippet.md`](examples/memory-snippet.md); the
+system-prompt snippet in [§4a](#4a-lm-studio--a-local-model) is the storage half.
+
+Two caveats. **Reliability scales with model capability:** frontier models (Claude, GPT-4-class)
+follow the policy well and fire the tools proactively; small local models understand the tools but
+are less consistent at *proactively* storing mid-conversation, so they benefit from an occasional
+nudge (recall tends to be steadier than proactive storage). And **over-storing is self-correcting:**
+if an eager model saves marginal notes, lazy decay and eviction sink and archive them automatically
+and `curate` only surfaces what's relevant — so it is safe to hand the model judgment rather than
+gate every write yourself.
+
 ### 4a. LM Studio + a local model
 
 **Prerequisites**
