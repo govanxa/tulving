@@ -4,9 +4,6 @@ Persistent, typed, searchable working memory for a single AI agent, with
 token-budget context curation (``curate(query, token_budget)``) as the
 headline primitive. Named after Endel Tulving, the psychologist who
 established that memory has types.
-
-This is a name-holding pre-release (0.0.1). The v0.1 implementation is in
-active development.
 """
 
 from tulving.adapters.embeddings import (
@@ -32,7 +29,7 @@ from tulving.exceptions import (
 from tulving.export import ImportReport, MemoryExporter, MemoryImporter
 from tulving.memory import Memory, SearchResult, StartupReport
 
-__version__ = "0.0.1"
+__version__ = "0.1.0"
 
 __all__ = [
     "ArchiveReason",
