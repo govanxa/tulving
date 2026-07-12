@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import sys
 import threading
 from pathlib import Path
 from typing import Any
@@ -59,6 +60,7 @@ def make_settings(**kw: Any) -> srv.ServerSettings:
         "default_token_budget": 4000,
         "read_only": False,
         "llm_configured": False,
+        "embedding_configured": True,
     }
     defaults.update(kw)
     return srv.ServerSettings(**defaults)
@@ -506,6 +508,237 @@ class TestConcurrencyAndStaticGuard:
         source = Path(srv.__file__).read_text(encoding="utf-8").lower()
         for pattern in (r"\bsse\b", r"\bwebsocket\b", r"host=", r"port=", r"\bbind\w*"):
             assert re.search(pattern, source) is None, f"forbidden network token {pattern!r}"
+
+
+# ===================================================================== torch-free offline mode
+
+
+class TestEmbeddingNone:
+    def test_build_embedder_none_returns_none(self) -> None:
+        with (
+            patch.object(srv, "LocalEmbedder") as local_cls,
+            patch.object(srv, "OpenAIEmbedder") as openai_cls,
+        ):
+            assert srv._build_embedder("none") is None
+        local_cls.assert_not_called()
+        openai_cls.assert_not_called()
+
+    def test_build_embedder_unknown_lists_three_choices(self) -> None:
+        with pytest.raises(ConfigError) as ei:
+            srv._build_embedder("bogus")
+        msg = str(ei.value)
+        assert "'local'" in msg
+        assert "'openai'" in msg
+        assert "'none'" in msg
+
+    def test_parser_accepts_embedding_none(self) -> None:
+        args = srv._build_parser().parse_args(["--embedding", "none"])
+        settings = srv._resolve_settings(args)
+        assert settings.embedding == "none"
+        assert settings.embedding_configured is False
+
+    def test_env_embedding_none_configures_offline(self, monkeypatch: Any) -> None:
+        monkeypatch.setenv("TULVING_EMBEDDING_ADAPTER", "none")
+        args = srv._build_parser().parse_args([])
+        settings = srv._resolve_settings(args)
+        assert settings.embedding == "none"
+        assert settings.embedding_configured is False
+
+    def test_default_embedding_is_local_and_configured(self, monkeypatch: Any) -> None:
+        monkeypatch.delenv("TULVING_EMBEDDING_ADAPTER", raising=False)
+        args = srv._build_parser().parse_args([])
+        settings = srv._resolve_settings(args)
+        assert settings.embedding == "local"
+        assert settings.embedding_configured is True
+
+    def test_still_exactly_six_tools_in_offline_mode(self) -> None:
+        offline = make_settings(embedding="none", embedding_configured=False)
+        server, _memory, _settings = build(settings=offline)
+        tools = _run(server.list_tools())
+        names = {t.name for t in tools}
+        assert names == TOOL_NAMES
+
+    def test_search_disabled_returns_loud_tool_error(self) -> None:
+        offline = make_settings(embedding="none", embedding_configured=False)
+        server, memory, _settings = build(settings=offline)
+        with pytest.raises(ToolError) as ei:
+            _run(server.call_tool("memory_search", {"query": "auth"}))
+        msg = str(ei.value)
+        assert "--embedding none" in msg
+        assert "memory_curate" in msg
+        assert "memory_get" in msg
+        memory.search.assert_not_called()
+
+    def test_search_disabled_message_is_redacted_shape(self) -> None:
+        offline = make_settings(embedding="none", embedding_configured=False)
+        server, _memory, _settings = build(settings=offline)
+        with pytest.raises(ToolError) as ei:
+            _run(server.call_tool("memory_search", {"query": "auth"}))
+        msg = str(ei.value)
+        assert srv._emit(srv._SEARCH_DISABLED_NOTE) in msg
+        assert "internal error" not in msg
+
+    def test_search_disabled_message_passes_through_emit_choke_point(
+        self, monkeypatch: Any
+    ) -> None:
+        """Locks that the raise site actually calls ``_emit`` (not just an equal string).
+
+        ``_emit``/``redact_text`` is a no-op on already-clean text, so an equality
+        assertion against ``_emit(_SEARCH_DISABLED_NOTE)`` cannot detect a raise site
+        that bypasses the choke point entirely. Patch ``_emit`` to a detectable
+        transform and assert the mark appears in the raised message.
+        """
+        offline = make_settings(embedding="none", embedding_configured=False)
+        server, _memory, _settings = build(settings=offline)
+        monkeypatch.setattr(srv, "_emit", lambda text: text + "<<EMIT-MARK>>")
+        with pytest.raises(ToolError) as ei:
+            _run(server.call_tool("memory_search", {"query": "auth"}))
+        assert "<<EMIT-MARK>>" in str(ei.value)
+
+    def test_search_disabled_description_is_mode_aware(self) -> None:
+        offline = make_settings(embedding="none", embedding_configured=False)
+        server, _memory, _settings = build(settings=offline)
+        tools = {t.name: t for t in _run(server.list_tools())}
+        assert tools["memory_search"].description == srv._DESC_SEARCH_DISABLED
+
+        local_server, _memory2, _settings2 = build(settings=make_settings())
+        local_tools = {t.name: t for t in _run(local_server.list_tools())}
+        assert local_tools["memory_search"].description == srv._DESC_SEARCH
+
+    def test_curate_works_end_to_end_offline(self) -> None:
+        offline = make_settings(embedding="none", embedding_configured=False)
+        server, memory, _settings = build(settings=offline)
+        memory.curate.return_value = CuratedContext(
+            content="briefing body",
+            entries=[],
+            token_count=120,
+            budget_remaining=1114,
+            sources_consulted=7,
+        )
+        text = _text(_run(server.call_tool("memory_curate", {"query": "auth"})))
+        assert "tokens: 120" in text
+        assert "budget remaining: 1114" in text
+        assert "sources consulted: 7" in text
+        memory.curate.assert_called_once()
+
+    def test_store_get_forget_list_work_offline(self) -> None:
+        offline = make_settings(embedding="none", embedding_configured=False)
+        server, memory, _settings = build(settings=offline)
+        memory.store.return_value = make_entry(entry_id="abc123", key="decision:auth")
+        text = _text(_run(server.call_tool("memory_store", {"content": "c", "type": "decision"})))
+        assert "abc123" in text
+        memory.store.assert_called_once()
+
+        memory.get.return_value = make_entry(content="the answer")
+        text = _text(_run(server.call_tool("memory_get", {"key": "decision:auth"})))
+        assert "the answer" in text
+        memory.get.assert_called_once()
+
+        memory.forget.return_value = True
+        text = _text(_run(server.call_tool("memory_forget", {"key": "decision:auth"})))
+        assert text == "Archived memory with key 'decision:auth'."
+        memory.forget.assert_called_once()
+
+        memory.list_keys.return_value = ["decision:auth"]
+        text = _text(_run(server.call_tool("memory_list_keys", {})))
+        assert "decision:auth" in text
+        memory.list_keys.assert_called_once()
+
+    def test_offload_still_used_by_non_search_tools_offline(self) -> None:
+        offline = make_settings(embedding="none", embedding_configured=False)
+        server, memory, _settings = build(settings=offline)
+        memory.store.return_value = make_entry()
+        memory.get.return_value = make_entry()
+        memory.curate.return_value = CuratedContext("b", [], 1, 1, 1)
+        memory.forget.return_value = True
+        memory.list_keys.return_value = []
+
+        calls: list[Any] = []
+        real = anyio.to_thread.run_sync
+
+        async def spy(func: Any, *a: Any, **k: Any) -> Any:
+            calls.append(func)
+            return await real(func, *a, **k)
+
+        invocations = [
+            ("memory_store", {"content": "c", "type": "fact"}),
+            ("memory_get", {"key": "k"}),
+            ("memory_curate", {"query": "q"}),
+            ("memory_forget", {"key": "k"}),
+            ("memory_list_keys", {}),
+        ]
+        with patch("anyio.to_thread.run_sync", spy):
+            for name, args in invocations:
+                _run(server.call_tool(name, args))
+            with pytest.raises(ToolError):
+                _run(server.call_tool("memory_search", {"query": "q"}))
+        assert len(calls) == len(invocations)
+        memory.search.assert_not_called()
+
+    def test_offline_constants_carry_no_network_tokens(self) -> None:
+        for pattern in (r"\bsse\b", r"\bwebsocket\b", r"host=", r"port=", r"\bbind\w*"):
+            for text in (
+                srv._NO_EMBEDDER_WARNING,
+                srv._SEARCH_DISABLED_NOTE,
+                srv._DESC_SEARCH_DISABLED,
+            ):
+                assert re.search(pattern, text.lower()) is None, (
+                    f"forbidden network token in {text!r}"
+                )
+
+
+class TestEmbeddingNoneMainLifecycle:
+    def test_offline_mode_warns_no_embedder(self, caplog: Any) -> None:
+        with (
+            patch.object(srv, "Memory"),
+            patch.object(srv, "build_server"),
+        ):
+            with caplog.at_level(logging.WARNING, logger="tulving.mcp"):
+                code = srv.main(["--memory-path", "./m", "--embedding", "none"])
+        assert code == srv.EXIT_OK
+        assert any(
+            "--embedding none" in r.message and "semantic search" in r.message
+            for r in caplog.records
+        )
+
+    def test_offline_mode_constructs_no_embedder(self) -> None:
+        with (
+            patch.object(srv, "Memory") as mem_cls,
+            patch.object(srv, "LocalEmbedder") as local_cls,
+            patch.object(srv, "OpenAIEmbedder") as openai_cls,
+            patch.object(srv, "build_server"),
+        ):
+            srv.main(["--memory-path", "./m", "--embedding", "none"])
+        assert mem_cls.call_args.kwargs["embedding_adapter"] is None
+        local_cls.assert_not_called()
+        openai_cls.assert_not_called()
+
+    def test_no_torch_import_in_offline_main(self) -> None:
+        with (
+            patch.object(srv, "Memory"),
+            patch.object(srv, "LocalEmbedder") as local_cls,
+            patch.object(srv, "OpenAIEmbedder") as openai_cls,
+            patch.object(srv, "build_server"),
+        ):
+            if "torch" not in sys.modules and "sentence_transformers" not in sys.modules:
+                srv.main(["--memory-path", "./m", "--embedding", "none"])
+                assert "torch" not in sys.modules
+                assert "sentence_transformers" not in sys.modules
+            else:
+                pytest.skip("torch/sentence_transformers already imported in this process")
+        local_cls.assert_not_called()
+        openai_cls.assert_not_called()
+
+    def test_local_and_openai_still_default_paths_unaffected(self, caplog: Any) -> None:
+        with (
+            patch.object(srv, "Memory"),
+            patch.object(srv, "LocalEmbedder") as local_cls,
+            patch.object(srv, "build_server"),
+        ):
+            with caplog.at_level(logging.WARNING, logger="tulving.mcp"):
+                srv.main(["--memory-path", "./m"])
+        local_cls.assert_called_once()
+        assert not any("no embedding adapter configured" in r.message for r in caplog.records)
 
 
 # ===================================================================== 14-20 main() lifecycle
