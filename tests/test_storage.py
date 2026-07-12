@@ -1323,6 +1323,117 @@ class TestPragmas:
             blocker.close()
             b.close()
 
+    def test_reopen_existing_nonempty_store_leaves_header_byte_identical(
+        self, tmp_path: Path
+    ) -> None:
+        """DB FIX regression: PRAGMA auto_vacuum was re-issued on EVERY new
+        connection, and SQLite bumps the header's file-change-counter (offset
+        24-27) on that re-statement even at an unchanged value -- a phantom
+        write with no data-level effect, and the sole source of a read-only
+        Memory open's "phantom mutation". A new connection to an EXISTING,
+        non-empty database must now leave the file byte-for-byte identical."""
+        db = tmp_path / "t.db"
+        writer = SQLiteBackend(db)
+        writer.create(make_row("seed"))
+        writer.close()
+
+        before = db.read_bytes()
+
+        reader = SQLiteBackend(db)  # a brand-new connection to the existing file
+        reader._connection()
+        reader.close()
+
+        after = db.read_bytes()
+        assert after == before
+
+    def test_auto_vacuum_pragma_skipped_on_existing_nonempty_database(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Direct proof of the skip itself (not just its byte-level side effect):
+        wrap sqlite3.connect so the returned connection's constructor-time PRAGMA
+        sequence is observable via the auto_vacuum header value BEFORE vs AFTER
+        a second open -- an actual re-SET would be undetectable this way since it's
+        the same value, so instead we assert the skip via a spy on connect()."""
+        db = tmp_path / "t.db"
+        writer = SQLiteBackend(db)
+        writer.create(make_row("seed"))
+        writer.close()
+
+        executed_sql: list[str] = []
+        real_connect = storage_module.sqlite3.connect
+
+        class _SpyConnection(sqlite3.Connection):
+            def execute(self, sql: str, *args: Any) -> sqlite3.Cursor:  # type: ignore[override]
+                executed_sql.append(sql)
+                return super().execute(sql, *args)
+
+        def spying_connect(*args: Any, **kwargs: Any) -> sqlite3.Connection:
+            kwargs["factory"] = _SpyConnection
+            return real_connect(*args, **kwargs)
+
+        monkeypatch.setattr(storage_module.sqlite3, "connect", spying_connect)
+        reader = SQLiteBackend(db)
+        try:
+            reader._connection()
+        finally:
+            reader.close()
+
+        assert not any("auto_vacuum" in sql for sql in executed_sql)
+        assert any("journal_mode" in sql for sql in executed_sql)
+        # busy_timeout is issued before any other statement on the new connection.
+        pragma_calls = [sql for sql in executed_sql if sql.strip().upper().startswith("PRAGMA")]
+        assert pragma_calls[0].lower().startswith("pragma busy_timeout")
+
+    def test_busy_timeout_is_first_statement_on_fresh_connection(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """DB FIX regression: busy_timeout must be configured before any other
+        pragma so that a header-writing statement under writer contention RETRIES
+        instead of failing immediately with SQLite's 0ms default wait."""
+        db = tmp_path / "t.db"
+        executed_sql: list[str] = []
+        real_connect = storage_module.sqlite3.connect
+
+        class _SpyConnection(sqlite3.Connection):
+            def execute(self, sql: str, *args: Any) -> sqlite3.Cursor:  # type: ignore[override]
+                executed_sql.append(sql)
+                return super().execute(sql, *args)
+
+        def spying_connect(*args: Any, **kwargs: Any) -> sqlite3.Connection:
+            kwargs["factory"] = _SpyConnection
+            return real_connect(*args, **kwargs)
+
+        monkeypatch.setattr(storage_module.sqlite3, "connect", spying_connect)
+        backend = SQLiteBackend(db)  # fresh db: auto_vacuum still runs
+        try:
+            pragma_calls = [sql for sql in executed_sql if sql.strip().upper().startswith("PRAGMA")]
+            assert pragma_calls[0].lower().startswith("pragma busy_timeout")
+            assert any("auto_vacuum" in sql for sql in pragma_calls)
+        finally:
+            backend.close()
+
+    def test_new_connection_to_existing_store_under_held_write_lock_succeeds(
+        self, tmp_path: Path
+    ) -> None:
+        """DB FIX end-to-end: the DB engineer reproduced 16/16 failures opening a
+        new connection to an EXISTING store while a competing writer held
+        BEGIN IMMEDIATE (auto_vacuum re-statement hit SQLite's 0ms default wait
+        before busy_timeout was configured). With auto_vacuum skipped on existing
+        stores and busy_timeout set first, a fresh connection must open cleanly."""
+        db = tmp_path / "t.db"
+        seed = SQLiteBackend(db)
+        seed.create(make_row("seed"))
+        seed.close()
+
+        blocker = sqlite3.connect(db, isolation_level=None)
+        blocker.execute("BEGIN IMMEDIATE")
+        try:
+            reader = SQLiteBackend(db)  # must not raise StorageError
+            reader.close()
+        finally:
+            blocker.rollback()
+            blocker.close()
+
 
 # ---------------------------------------------------------------------------
 # SQLite-only: persistence across close/reopen
