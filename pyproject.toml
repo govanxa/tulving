@@ -47,6 +47,7 @@ anthropic = [
 ]
 
 [project.scripts]
+tulving = "tulving.cli:main"
 tulving-mcp = "tulving.mcp.server:main"
 
 [project.urls]
