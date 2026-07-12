@@ -78,6 +78,24 @@ module = "hnswlib"
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
+# numpy >= 2.5 stubs use PEP 695 `type` statements, which mypy rejects while
+# python_version = "3.11" (parse aborts before any project file is checked).
+# numpy enters the build only transitively (sentence_transformers, installed via
+# [local], is typed and imports it). Skip following so the gate works in a venv
+# that has [local] installed; CI (no [local]) never reaches numpy either way.
+module = ["numpy", "numpy.*"]
+follow_imports = "skip"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# sentence_transformers is typed-and-installed in a [local] venv, so
+# ignore_missing_imports alone does not stop mypy entering it (and pulling
+# numpy/torch stubs). D9: it is only imported inside gated adapter constructors.
+module = ["sentence_transformers", "sentence_transformers.*", "torch", "torch.*"]
+follow_imports = "skip"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
 # Optional extras, imported only inside gated adapter constructors (D9).
 module = ["sentence_transformers", "openai"]
 ignore_missing_imports = true
