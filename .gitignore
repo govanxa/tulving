@@ -35,3 +35,4 @@ test_memory/
 Thumbs.db
 .idea/
 .vscode/
+*.py,cover
