@@ -325,8 +325,11 @@ sequence with exact arguments and the exact responses Tulving returns:
 > / `tulving maintenance`) and the MCP server have no `sensitive_keys` parameter of their own, so
 > their protection is the built-in defaults plus content shape only; and short/low-entropy secrets
 > (fewer than 3 character classes, or under 24 characters) can still slip through the shape check —
-> a documented residual, not a bug. Neutral keys (`fact:session-ttl`, `decision:api-scheme`,
-> `decision:login-flow`) remain good practice regardless.
+> a documented residual, not a bug. A secret broken across two or more whitespace runs (e.g.
+> wrapped across several lines) can likewise evade the shape check — one break is still caught,
+> but the detector only joins adjacent pairs, so a second break slips through — same mitigation:
+> declare the key via `Memory(sensitive_keys=[...])`. Neutral keys (`fact:session-ttl`,
+> `decision:api-scheme`, `decision:login-flow`) remain good practice regardless.
 
 What each tool is for:
 
@@ -619,6 +622,11 @@ as §6a, computed with the shared token estimator), and — if you pass `--probe
 (question + expected-substring pairs; `--init-probes` writes a starter file) — scores answer
 correctness against an OpenAI-compatible endpoint (LM Studio's `http://localhost:1234/v1` by
 default, or `--lm-url`/`--model` for something else), matching §6b's none/dump/curate comparison.
+When you pass `--probes`, your memory dump — redacted first, per the same masking rules as every
+other emission surface ([§4c](#4c-mcp-inspector--tool-reference)) — plus your probe questions are
+sent to the endpoint you configured; with the default localhost LM Studio URL that never leaves
+your machine, but `--lm-url` can point anywhere, so treat a remote endpoint as sending (redacted)
+memory content off-box. Without `--probes`, nothing is ever transmitted anywhere.
 
 Every run appends one dated row to a JSON history log (`--history`, default `eval_history.json`)
 — that log **is** the trend — and renders it into a self-contained `report.html` (inline CSS/SVG,
@@ -742,6 +750,10 @@ tulving maintenance export  --store ./agent_memory --out backup.json   # 1. safe
 tulving maintenance purge   --store ./agent_memory --older-than 90d    # 2. drop old archived rows
 tulving maintenance vacuum  --store ./agent_memory                     # 3. reclaim file size
 ```
+
+`vacuum` needs roughly 2x the database size in free disk space transiently, holds the write lock
+for its duration, and is slow on OneDrive/network paths — plan it as an offline maintenance window,
+not a background task.
 
 `purge` shares `purge_archived`'s reason-awareness — it **refuses to delete summarization-source
 entries** unless you pass `--include-summarized` (or `--reason summarized`) explicitly, so
