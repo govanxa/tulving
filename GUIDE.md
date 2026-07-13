@@ -44,6 +44,37 @@ Add `[local]` or `[openai]` to enable semantic search. A `hnswlib` wheel is inst
 automatically; if your platform lacks a prebuilt wheel, install a C/C++ toolchain first
 (Windows: Visual C++ Build Tools; Linux: `build-essential`; macOS: Xcode Command Line Tools).
 
+### Windows: console scripts on PATH, and one MCP config gotcha
+
+Real friction from a first-time Windows install, in case you hit the same:
+
+1. **`tulving` / `tulving-mcp` "not recognized" right after `pip install`.** The python.org
+   per-user installer often adds `...\Python31x\` to PATH but **not** `...\Python31x\Scripts\` —
+   and `Scripts\` is where pip puts console scripts. If either command errors with `'tulving-mcp'
+   is not recognized as an internal or external command`, add the `Scripts\` folder for that
+   Python to PATH (Settings → *Edit environment variables* → *Path*), then open a **new** shell.
+2. **PATH entries are folders, not files.** Adding `...\Python31x\python.exe` itself to PATH does
+   not fix this — Windows searches the *directories* listed on PATH for a matching executable
+   name, so it must be the `Scripts\` folder, never the `python.exe` file.
+3. **Pick one invocation style in your MCP host config — never mix them.** Both of these are
+   valid for the `mcpServers` entry used throughout [§4](#4-using-tulving-over-mcp):
+
+   ```jsonc
+   // Style A — the console script (needs Scripts\ on PATH, see #1 above)
+   { "command": "tulving-mcp",
+     "args": ["--memory-path", "C:/path/to/agent_memory", "--embedding", "local"] }
+
+   // Style B — module invocation (works with any "python" on PATH; no Scripts\ needed)
+   { "command": "python",
+     "args": ["-m", "tulving.mcp.server", "--memory-path", "C:/path/to/agent_memory", "--embedding", "local"] }
+   ```
+
+   Mixing them — e.g. `"command": "tulving-mcp"` with the module-style `-m tulving.mcp.server`
+   flag tacked into `args` — fails with `unrecognized arguments: -m tulving.mcp.server`, because
+   that flag belongs to `python`, not to `tulving-mcp`'s own argument parser. If `tulving-mcp`
+   isn't resolving on PATH (gotcha #1) and you don't want to fix PATH, use Style B outright rather
+   than combining the two.
+
 ---
 
 ## 2. How it works — the mental model
@@ -724,6 +755,7 @@ runs across the Linux + Windows × Python 3.11–3.13 matrix (`.github/workflows
 
 | Symptom | Cause / fix |
 |---|---|
+| `'tulving-mcp'`/`'tulving'` is not recognized as a command (Windows) | `Scripts\` isn't on PATH, or your MCP config mixes invocation styles — see [Windows notes](#windows-console-scripts-on-path-and-one-mcp-config-gotcha) in §1. |
 | `ModuleNotFoundError: mcp` when running `tulving-mcp` | Install the extra: `pip install "tulving[mcp]"`. |
 | `tulving-mcp` exits with a `[local]`/`[openai]` hint | The chosen `--embedding` backend isn't installed or has no key. Install `[local]`, or set `OPENAI_API_KEY` and use `--embedding openai`. |
 | The model connects but never calls the tools | Use a tool-calling-capable model and add explicit memory-usage guidance to its system prompt (§4a). Confirm the tools work with the Inspector (§4c). |
