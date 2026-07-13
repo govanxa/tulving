@@ -550,6 +550,15 @@ class StorageBackend(Protocol):
         """Explicit atomic scope; non-reentrant (nesting raises)."""
         ...
 
+    def vacuum(self) -> None:
+        """Reclaim free file space.
+
+        SQLite: a full ``VACUUM`` outside any transaction (after a best-effort
+        WAL checkpoint). InMemory: a no-op (nothing to reclaim). Both raise
+        ``StorageError`` on a closed backend or a mid-transaction call (D6).
+        """
+        ...
+
 
 # ---------------------------------------------------------------------------
 # Schema DDL & migration runner (SQLite)
@@ -1430,6 +1439,37 @@ class SQLiteBackend:
         """Explicit atomic scope (D1 supersede); non-reentrant per thread."""
         return self._transaction_scope()
 
+    def vacuum(self) -> None:
+        """Reclaim free file space via a full ``VACUUM`` outside any transaction.
+
+        ``auto_vacuum=INCREMENTAL`` leaves deleted pages on the freelist until
+        a full VACUUM; this is the maintenance CLI's genuine-reclaim path. A
+        best-effort WAL checkpoint runs first; VACUUM itself runs in
+        autocommit (``isolation_level=None``), needs roughly 2x the database
+        size in temporary space, and holds the write lock for its duration —
+        acceptable under the single-writer, user-invoked model (ADR-015).
+
+        Raises:
+            StorageError: On a closed backend, a call issued from inside an
+                ambient ``transaction()``, or a VACUUM failure.
+        """
+        conn = self._connection()
+        if getattr(self._local, "in_txn", False):
+            raise StorageError("VACUUM cannot run inside a transaction")
+        with suppress(sqlite3.Error):
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        try:
+            conn.execute("VACUUM")
+        except sqlite3.Error as exc:
+            raise StorageError(f"VACUUM failed: {exc}") from exc
+        # In WAL mode VACUUM's own rewrite is itself journaled through the WAL
+        # rather than applied to the main file in place -- the file only
+        # shrinks on disk once that WAL is checkpointed back with TRUNCATE.
+        # Without this second checkpoint the main file keeps its pre-VACUUM
+        # size even though its logical page count has already dropped.
+        with suppress(sqlite3.Error):
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
 
 # ---------------------------------------------------------------------------
 # InMemoryBackend
@@ -1810,6 +1850,10 @@ class InMemoryBackend:
     def transaction(self) -> AbstractContextManager[None]:
         """Explicit atomic scope with real snapshot rollback; non-reentrant."""
         return self._transaction_scope()
+
+    def vacuum(self) -> None:
+        """No-op (nothing to reclaim in-process); StorageError on a closed backend."""
+        self._ensure_open()
 
 
 def _entry_matches(entry: _Row, filters: _Row) -> bool:

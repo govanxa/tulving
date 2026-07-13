@@ -98,6 +98,15 @@ _EMBEDDING_ADAPTER_SURFACE: Final[tuple[str, ...]] = (
     "normalizes",
 )
 
+
+def _file_size(path: Path) -> int:
+    """Byte size of ``path``, or 0 when it is absent (maintenance ``inspect``/``vacuum``)."""
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
 # ---------------------------------------------------------------------------
 # Decay wiring (formula + eviction pass live in context/decay.py — D12)
 # ---------------------------------------------------------------------------
@@ -158,6 +167,37 @@ class SearchResult:
     entry: MemoryEntry
     score: float  # [0.0, 1.0]; KV exact = 1.0, semantic = 1 - cosine distance
     match_type: MatchType  # KEY | SEMANTIC (TEMPORAL is curator-internal in v0.1)
+
+
+@dataclass(frozen=True)
+class StoreStats:
+    """Read-only snapshot for ``tulving maintenance inspect`` (D2/D3-safe).
+
+    Counts and on-disk sizes only — never computes or mutates importance,
+    never bumps ``last_accessed_at``.
+    """
+
+    live_count: int
+    archived_count: int
+    archived_by_reason: dict[str, int]  # keyed by ArchiveReason.value, all reasons present
+    total_count: int
+    db_bytes: int
+    wal_bytes: int
+    index_bytes: int
+    total_bytes: int
+    schema_version: int
+    embedding_model_id: str | None
+    embedding_dimension: int | None
+    distance_metric: str | None
+
+
+@dataclass(frozen=True)
+class VacuumResult:
+    """Outcome of ``Memory.vacuum()``."""
+
+    bytes_before: int
+    bytes_after: int
+    bytes_reclaimed: int  # max(before - after, 0)
 
 
 @dataclass(frozen=True)
@@ -1509,6 +1549,88 @@ class Memory:
             if len(page) < _PAGE:
                 return ids
             offset += _PAGE
+
+    # -------------------------------------------------------------- maintenance
+
+    def store_stats(self) -> StoreStats:
+        """Aggregate counts + on-disk sizes + meta (``tulving maintenance inspect``).
+
+        Read-only (D2/D3-safe): counts and ``os.stat`` sizes only — never
+        computes or mutates importance, never runs a decay pass, never bumps
+        ``last_accessed_at``. Legal on a ``read_only=True`` handle.
+
+        Returns:
+            The :class:`StoreStats` snapshot.
+        """
+        self._ensure_started()
+        live_count = self._store.count()
+        archived_by_reason = {
+            reason.value: self._store.count(include_archived=True, archive_reasons=[reason])
+            for reason in ArchiveReason
+        }
+        archived_count = sum(archived_by_reason.values())
+        meta = self._store.get_meta()
+        db_bytes = _file_size(self._memory_dir / DB_FILENAME)
+        wal_bytes = _file_size(self._memory_dir / (DB_FILENAME + "-wal"))
+        index_bytes = _file_size(self._memory_dir / INDEX_FILENAME)
+        return StoreStats(
+            live_count=live_count,
+            archived_count=archived_count,
+            archived_by_reason=archived_by_reason,
+            total_count=live_count + archived_count,
+            db_bytes=db_bytes,
+            wal_bytes=wal_bytes,
+            index_bytes=index_bytes,
+            total_bytes=db_bytes + wal_bytes + index_bytes,
+            schema_version=meta["schema_version"],
+            embedding_model_id=meta["embedding_model_id"],
+            embedding_dimension=meta["embedding_dimension"],
+            distance_metric=meta["distance_metric"],
+        )
+
+    def purgeable_count(
+        self,
+        *,
+        reasons: list[ArchiveReason] | None = None,
+        older_than: timedelta | None = None,
+    ) -> int:
+        """How many archived rows ``purge_archived`` would delete (read-only dry-run).
+
+        Backs ``tulving maintenance purge --dry-run`` and its confirmation
+        prompt; never deletes.
+
+        Returns:
+            The count of matching archived rows.
+        """
+        self._ensure_started()
+        return self._store.count_archived(reasons=reasons, older_than=older_than)
+
+    def vacuum(self) -> VacuumResult:
+        """Reclaim SQLite file space (``tulving maintenance vacuum``).
+
+        Requires a writable handle (holds the writer lock, ADR-015).
+        Measures the ``.db`` file before/after ``backend.vacuum()`` — a full
+        ``VACUUM``, which needs roughly 2x the database size in temporary
+        space and holds the write lock for its duration.
+
+        Returns:
+            The :class:`VacuumResult`.
+
+        Raises:
+            MemoryStoreError: On a read-only handle.
+            StorageError: Propagated from the backend on failure.
+        """
+        self._ensure_started()
+        self._require_writable()
+        db_path = self._memory_dir / DB_FILENAME
+        bytes_before = _file_size(db_path)
+        self._backend.vacuum()
+        bytes_after = _file_size(db_path)
+        return VacuumResult(
+            bytes_before=bytes_before,
+            bytes_after=bytes_after,
+            bytes_reclaimed=max(bytes_before - bytes_after, 0),
+        )
 
     # ---------------------------------------------------------------- sessions
 
