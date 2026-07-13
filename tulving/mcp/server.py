@@ -69,6 +69,30 @@ _NO_LLM_WARNING: Final[str] = (
     "enable summaries)"
 )
 
+# Boot-time loud half of the offline-mode degradation contract (stderr, once).
+_NO_EMBEDDER_WARNING: Final[str] = (
+    "no embedding adapter configured (--embedding none): semantic search "
+    "(memory_search) is disabled; store/get/curate/forget/list_keys work, and "
+    "curate ranks by exact-key match + importance/recency. To enable "
+    "find-by-meaning, restart with --embedding local (needs tulving[local]) or "
+    "--embedding openai (needs tulving[openai] + OPENAI_API_KEY)."
+)
+
+# Response-surface loud half: the text of the ToolError memory_search raises in offline mode.
+_SEARCH_DISABLED_NOTE: Final[str] = (
+    "semantic search (find-by-meaning) is unavailable in offline mode "
+    "(--embedding none): no embedder is configured. Use memory_curate for "
+    "relevance-ranked context (exact-key + importance/recency) or memory_get for "
+    "an exact key. To enable semantic search, restart the server with --embedding "
+    "local or --embedding openai."
+)
+
+# Tool description shown when search is disabled (resident-token cost is tiny and worth it).
+_DESC_SEARCH_DISABLED: Final[str] = (
+    "DISABLED in offline mode (--embedding none): semantic search requires an "
+    "embedder. Use memory_curate or memory_get instead."
+)
+
 _MCP_HINT: Final[str] = (
     'the MCP server requires the [mcp] extra; install it with: pip install "tulving[mcp]"'
 )
@@ -117,12 +141,13 @@ class ServerSettings:
     """Resolved configuration: CLI args override env vars override defaults."""
 
     memory_path: Path
-    embedding: str = "local"  # {local, openai}
+    embedding: str = "local"  # {local, openai, none}
     llm: str = "none"  # {none, claude}
     llm_model: str | None = None
     default_token_budget: int = DEFAULT_TOKEN_BUDGET
     read_only: bool = False
     llm_configured: bool = False  # derived: an LLM adapter is wired
+    embedding_configured: bool = True  # derived: an embedder is wired (False iff embedding=="none")
 
 
 def _emit(text: str) -> str:
@@ -261,7 +286,9 @@ def build_server(memory: Memory, settings: ServerSettings) -> Any:
             return _emit(f"No memory found for key '{key}'.")
         return _emit(_format_entry(entry))
 
-    @server.tool(description=_DESC_SEARCH)
+    search_desc = _DESC_SEARCH if settings.embedding_configured else _DESC_SEARCH_DISABLED
+
+    @server.tool(description=search_desc)
     @_guard
     async def memory_search(
         query: str,
@@ -269,6 +296,10 @@ def build_server(memory: Memory, settings: ServerSettings) -> Any:
         tags: list[str] | None = None,
         types: list[str] | None = None,
     ) -> str:
+        if not settings.embedding_configured:
+            # Loud, actionable, redacted - short-circuits BEFORE _offload; Memory.search
+            # is never called (it would silently narrow to KV-exact - see Design D-A).
+            raise ToolError(_emit(_SEARCH_DISABLED_NOTE))
         parsed_types: list[MemoryType] | None = None
         if types:
             for t in types:
@@ -356,12 +387,14 @@ def build_server(memory: Memory, settings: ServerSettings) -> Any:
 
 
 def _build_embedder(name: str) -> Any:
-    """Construct the embedding adapter selected by ``name``."""
+    """Construct the embedding adapter selected by ``name`` (``None`` for offline mode)."""
+    if name == "none":
+        return None
     if name == "local":
         return LocalEmbedder()
     if name == "openai":
         return OpenAIEmbedder()
-    raise ConfigError(f"unknown embedding adapter {name!r}; choose 'local' or 'openai'")
+    raise ConfigError(f"unknown embedding adapter {name!r}; choose 'local', 'openai', or 'none'")
 
 
 def _build_llm(settings: ServerSettings) -> Any:
@@ -411,7 +444,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--memory-path", default=None, help="Memory storage directory.")
     parser.add_argument(
-        "--embedding", choices=["local", "openai"], default=None, help="Embedding backend."
+        "--embedding",
+        choices=["local", "openai", "none"],
+        default=None,
+        help="Embedding backend. 'none' = torch-free offline mode (semantic search disabled).",
     )
     parser.add_argument(
         "--llm", choices=["none", "claude"], default=None, help="LLM for summarization."
@@ -450,6 +486,7 @@ def _resolve_settings(args: argparse.Namespace) -> ServerSettings:
         default_token_budget=budget,
         read_only=args.read_only,
         llm_configured=llm != "none",
+        embedding_configured=embedding != "none",
     )
 
 
@@ -514,6 +551,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if not settings.llm_configured:
         logger.warning(_NO_LLM_WARNING)  # the loud half of the degradation contract
+
+    if not settings.embedding_configured:
+        logger.warning(_NO_EMBEDDER_WARNING)  # loud half of the offline-mode degradation contract
 
     try:
         report = memory.startup()

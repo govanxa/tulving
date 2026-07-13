@@ -550,6 +550,15 @@ class StorageBackend(Protocol):
         """Explicit atomic scope; non-reentrant (nesting raises)."""
         ...
 
+    def vacuum(self) -> None:
+        """Reclaim free file space.
+
+        SQLite: a full ``VACUUM`` outside any transaction (after a best-effort
+        WAL checkpoint). InMemory: a no-op (nothing to reclaim). Both raise
+        ``StorageError`` on a closed backend or a mid-transaction call (D6).
+        """
+        ...
+
 
 # ---------------------------------------------------------------------------
 # Schema DDL & migration runner (SQLite)
@@ -969,6 +978,15 @@ class SQLiteBackend:
         self._ensure_open()
         conn: sqlite3.Connection | None = getattr(self._local, "conn", None)
         if conn is None:
+            # A non-empty file already exists: auto_vacuum is a documented no-op
+            # there (changing the mode on an existing database requires a full
+            # VACUUM; merely restating it does not take effect) -- but SQLite
+            # still increments the header's file-change-counter every time the
+            # PRAGMA is re-issued, even at an unchanged value. Skip it entirely
+            # in that case so opening a new connection to an EXISTING store
+            # never dirties a single header byte just from being opened (DB fix:
+            # this was the sole source of the read-only "phantom write").
+            is_existing_nonempty = self._db_path.exists() and self._db_path.stat().st_size > 0
             try:
                 # check_same_thread=False so close() can reach every thread's
                 # connection; thread-locality is guaranteed by this method.
@@ -976,13 +994,22 @@ class SQLiteBackend:
                     str(self._db_path), isolation_level=None, check_same_thread=False
                 )
                 conn.row_factory = sqlite3.Row
-                # auto_vacuum MUST precede any header-writing pragma
-                # (journal_mode initializes the header); it is a silent no-op
-                # on an already-initialized database.
-                conn.execute("PRAGMA auto_vacuum = INCREMENTAL")
+                # busy_timeout FIRST, before any other pragma: auto_vacuum and
+                # journal_mode are header-writing pragmas that need the write
+                # lock, and SQLite's per-connection default wait is 0ms until
+                # busy_timeout is set. Under a live writer, a new connection
+                # that hits auto_vacuum/journal_mode before busy_timeout is set
+                # fails immediately with "database is locked" instead of
+                # retrying (DB fix: reproduced 16/16 at the auto_vacuum line).
+                conn.execute(f"PRAGMA busy_timeout = {self._busy_timeout_ms}")
+                if not is_existing_nonempty:
+                    # auto_vacuum MUST precede any OTHER header-writing pragma
+                    # on a brand-new (or still-empty) database (journal_mode
+                    # initializes the header) -- see the skip note above for
+                    # why an existing non-empty database never runs this.
+                    conn.execute("PRAGMA auto_vacuum = INCREMENTAL")
                 conn.execute("PRAGMA journal_mode = WAL")
                 conn.execute("PRAGMA foreign_keys = ON")
-                conn.execute(f"PRAGMA busy_timeout = {self._busy_timeout_ms}")
                 conn.execute("PRAGMA synchronous = NORMAL")
                 conn.execute("PRAGMA case_sensitive_like = ON")
             except sqlite3.Error as exc:
@@ -1412,6 +1439,37 @@ class SQLiteBackend:
         """Explicit atomic scope (D1 supersede); non-reentrant per thread."""
         return self._transaction_scope()
 
+    def vacuum(self) -> None:
+        """Reclaim free file space via a full ``VACUUM`` outside any transaction.
+
+        ``auto_vacuum=INCREMENTAL`` leaves deleted pages on the freelist until
+        a full VACUUM; this is the maintenance CLI's genuine-reclaim path. A
+        best-effort WAL checkpoint runs first; VACUUM itself runs in
+        autocommit (``isolation_level=None``), needs roughly 2x the database
+        size in temporary space, and holds the write lock for its duration —
+        acceptable under the single-writer, user-invoked model (ADR-015).
+
+        Raises:
+            StorageError: On a closed backend, a call issued from inside an
+                ambient ``transaction()``, or a VACUUM failure.
+        """
+        conn = self._connection()
+        if getattr(self._local, "in_txn", False):
+            raise StorageError("VACUUM cannot run inside a transaction")
+        with suppress(sqlite3.Error):
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        try:
+            conn.execute("VACUUM")
+        except sqlite3.Error as exc:
+            raise StorageError(f"VACUUM failed: {exc}") from exc
+        # In WAL mode VACUUM's own rewrite is itself journaled through the WAL
+        # rather than applied to the main file in place -- the file only
+        # shrinks on disk once that WAL is checkpointed back with TRUNCATE.
+        # Without this second checkpoint the main file keeps its pre-VACUUM
+        # size even though its logical page count has already dropped.
+        with suppress(sqlite3.Error):
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
 
 # ---------------------------------------------------------------------------
 # InMemoryBackend
@@ -1792,6 +1850,10 @@ class InMemoryBackend:
     def transaction(self) -> AbstractContextManager[None]:
         """Explicit atomic scope with real snapshot rollback; non-reentrant."""
         return self._transaction_scope()
+
+    def vacuum(self) -> None:
+        """No-op (nothing to reclaim in-process); StorageError on a closed backend."""
+        self._ensure_open()
 
 
 def _entry_matches(entry: _Row, filters: _Row) -> bool:

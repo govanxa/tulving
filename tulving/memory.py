@@ -72,7 +72,12 @@ from tulving.exceptions import (
 )
 from tulving.export import ImportReport, MemoryExporter, MemoryImporter
 from tulving.kv_index import KVIndex
-from tulving.security import compile_key_patterns, contain_path, redact_text
+from tulving.security import (
+    compile_explicit_patterns,
+    compile_key_patterns,
+    contain_path,
+    redact_text,
+)
 from tulving.semantic_index import ReconcileReport, SemanticIndex
 from tulving.store import MemoryStore
 
@@ -97,6 +102,15 @@ _EMBEDDING_ADAPTER_SURFACE: Final[tuple[str, ...]] = (
     "distance_metric",
     "normalizes",
 )
+
+
+def _file_size(path: Path) -> int:
+    """Byte size of ``path``, or 0 when it is absent (maintenance ``inspect``/``vacuum``)."""
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
 
 # ---------------------------------------------------------------------------
 # Decay wiring (formula + eviction pass live in context/decay.py — D12)
@@ -158,6 +172,37 @@ class SearchResult:
     entry: MemoryEntry
     score: float  # [0.0, 1.0]; KV exact = 1.0, semantic = 1 - cosine distance
     match_type: MatchType  # KEY | SEMANTIC (TEMPORAL is curator-internal in v0.1)
+
+
+@dataclass(frozen=True)
+class StoreStats:
+    """Read-only snapshot for ``tulving maintenance inspect`` (D2/D3-safe).
+
+    Counts and on-disk sizes only — never computes or mutates importance,
+    never bumps ``last_accessed_at``.
+    """
+
+    live_count: int
+    archived_count: int
+    archived_by_reason: dict[str, int]  # keyed by ArchiveReason.value, all reasons present
+    total_count: int
+    db_bytes: int
+    wal_bytes: int
+    index_bytes: int
+    total_bytes: int
+    schema_version: int
+    embedding_model_id: str | None
+    embedding_dimension: int | None
+    distance_metric: str | None
+
+
+@dataclass(frozen=True)
+class VacuumResult:
+    """Outcome of ``Memory.vacuum()``."""
+
+    bytes_before: int
+    bytes_after: int
+    bytes_reclaimed: int  # max(before - after, 0)
 
 
 @dataclass(frozen=True)
@@ -563,7 +608,12 @@ class Memory:
                 rollups). ``None`` degrades loudly (warning + visible digest),
                 never silently.
             storage_backend: Injected backend; None opens SQLite in ``path``.
-            sensitive_keys: Extra sensitive-key patterns for redaction.
+            sensitive_keys: Extra sensitive-key patterns for redaction. Merged
+                with the built-in defaults for the surgical ``redact_text``
+                scrub AND compiled separately as explicit-only patterns
+                (v0.2 D-v02-7 Q3): a match on THESE always whole-masks the
+                entry's content unconditionally, even when the key also
+                matches a built-in default.
             lifecycle: Policy knobs; None uses ``LifecycleConfig()`` defaults.
             read_only: Skip the writer lock; refuse writes, never touch,
                 never create/migrate anything (a nonexistent store is
@@ -648,6 +698,11 @@ class Memory:
             )
             self._config = lifecycle if lifecycle is not None else LifecycleConfig()
             self._key_patterns = compile_key_patterns(sensitive_keys)
+            # ONLY the user-declared patterns (v0.2 D-v02-7 Q3): threaded
+            # SEPARATELY from the merged self._key_patterns so a user
+            # declaration masks unconditionally, even on overlap with a
+            # built-in default. Never merge these two sets.
+            self._explicit_key_patterns = compile_explicit_patterns(sensitive_keys)
             # Consumed by the MemorySummarizer (summarize() + end-of-session
             # rollups). None degrades loudly there — never called elsewhere.
             self._llm = llm_adapter
@@ -1263,6 +1318,7 @@ class Memory:
                         self._evaluator,
                         token_safety_margin=self._config.token_safety_margin,
                         key_patterns=self._key_patterns,
+                        explicit_key_patterns=self._explicit_key_patterns,
                         estimator=estimator,
                         now_fn=self._clock,
                     )
@@ -1312,6 +1368,7 @@ class Memory:
                         self._agent_id,
                         self._clock,
                         key_patterns=self._key_patterns,
+                        explicit_key_patterns=self._explicit_key_patterns,
                     )
                 summarizer = self._summarizer_impl
         return summarizer
@@ -1510,6 +1567,88 @@ class Memory:
                 return ids
             offset += _PAGE
 
+    # -------------------------------------------------------------- maintenance
+
+    def store_stats(self) -> StoreStats:
+        """Aggregate counts + on-disk sizes + meta (``tulving maintenance inspect``).
+
+        Read-only (D2/D3-safe): counts and ``os.stat`` sizes only — never
+        computes or mutates importance, never runs a decay pass, never bumps
+        ``last_accessed_at``. Legal on a ``read_only=True`` handle.
+
+        Returns:
+            The :class:`StoreStats` snapshot.
+        """
+        self._ensure_started()
+        live_count = self._store.count()
+        archived_by_reason = {
+            reason.value: self._store.count(include_archived=True, archive_reasons=[reason])
+            for reason in ArchiveReason
+        }
+        archived_count = sum(archived_by_reason.values())
+        meta = self._store.get_meta()
+        db_bytes = _file_size(self._memory_dir / DB_FILENAME)
+        wal_bytes = _file_size(self._memory_dir / (DB_FILENAME + "-wal"))
+        index_bytes = _file_size(self._memory_dir / INDEX_FILENAME)
+        return StoreStats(
+            live_count=live_count,
+            archived_count=archived_count,
+            archived_by_reason=archived_by_reason,
+            total_count=live_count + archived_count,
+            db_bytes=db_bytes,
+            wal_bytes=wal_bytes,
+            index_bytes=index_bytes,
+            total_bytes=db_bytes + wal_bytes + index_bytes,
+            schema_version=meta["schema_version"],
+            embedding_model_id=meta["embedding_model_id"],
+            embedding_dimension=meta["embedding_dimension"],
+            distance_metric=meta["distance_metric"],
+        )
+
+    def purgeable_count(
+        self,
+        *,
+        reasons: list[ArchiveReason] | None = None,
+        older_than: timedelta | None = None,
+    ) -> int:
+        """How many archived rows ``purge_archived`` would delete (read-only dry-run).
+
+        Backs ``tulving maintenance purge --dry-run`` and its confirmation
+        prompt; never deletes.
+
+        Returns:
+            The count of matching archived rows.
+        """
+        self._ensure_started()
+        return self._store.count_archived(reasons=reasons, older_than=older_than)
+
+    def vacuum(self) -> VacuumResult:
+        """Reclaim SQLite file space (``tulving maintenance vacuum``).
+
+        Requires a writable handle (holds the writer lock, ADR-015).
+        Measures the ``.db`` file before/after ``backend.vacuum()`` — a full
+        ``VACUUM``, which needs roughly 2x the database size in temporary
+        space and holds the write lock for its duration.
+
+        Returns:
+            The :class:`VacuumResult`.
+
+        Raises:
+            MemoryStoreError: On a read-only handle.
+            StorageError: Propagated from the backend on failure.
+        """
+        self._ensure_started()
+        self._require_writable()
+        db_path = self._memory_dir / DB_FILENAME
+        bytes_before = _file_size(db_path)
+        self._backend.vacuum()
+        bytes_after = _file_size(db_path)
+        return VacuumResult(
+            bytes_before=bytes_before,
+            bytes_after=bytes_after,
+            bytes_reclaimed=max(bytes_before - bytes_after, 0),
+        )
+
     # ---------------------------------------------------------------- sessions
 
     def session(self, goal: str | None = None) -> _SessionContextManager:
@@ -1574,7 +1713,8 @@ class Memory:
 
         Assembles a :class:`MemoryExporter` over this handle's store, compiled
         sensitive-key patterns (so the user's ``sensitive_keys`` reach the
-        export surface — security req #1), and containment root (default: the
+        export surface — security req #1, threaded both merged AND
+        explicit-only per D-v02-7 Q3), and containment root (default: the
         memory directory). Redaction is ON unless ``include_sensitive=True``.
 
         Args:
@@ -1593,6 +1733,7 @@ class Memory:
             self._store,
             allowed_root=allowed_root if allowed_root is not None else self._memory_dir,
             sensitive_key_patterns=self._key_patterns,
+            explicit_key_patterns=self._explicit_key_patterns,
         )
         exporter.to_json(
             path,

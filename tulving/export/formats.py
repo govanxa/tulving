@@ -27,8 +27,8 @@ from tulving.entry import MemoryEntry
 from tulving.exceptions import MemoryStoreError, StorageError
 from tulving.security import (
     contain_path,
-    is_sensitive_key,
     redact_text,
+    should_mask_content,
     validate_leaf_name,
 )
 from tulving.store import MemoryStore
@@ -97,6 +97,7 @@ class MemoryExporter:
         *,
         allowed_root: str | Path | None = None,
         sensitive_key_patterns: Sequence[Pattern[str]] | None = None,
+        explicit_key_patterns: Sequence[Pattern[str]] | None = None,
     ) -> None:
         """Bind the store and the redaction / path-containment policy.
 
@@ -106,12 +107,22 @@ class MemoryExporter:
                 defaults to ``Path.cwd()`` resolved at export time. A blank
                 string is refused by containment (never the filesystem root).
             sensitive_key_patterns: Compiled sensitive-key patterns (Memory
-                passes ``compile_key_patterns(sensitive_keys)``); ``None``
-                falls back to security's module defaults.
+                passes ``compile_key_patterns(sensitive_keys)``) used for the
+                surgical ``redact_text`` scrub; ``None`` falls back to
+                security's module defaults.
+            explicit_key_patterns: ONLY the user-declared
+                ``Memory(sensitive_keys=...)`` patterns (``compile_explicit_
+                patterns``), threaded SEPARATELY from ``sensitive_key_patterns``
+                so a user declaration masks unconditionally even on overlap
+                with a built-in default (D-v02-7 Q3). ``None`` when the
+                caller declared none. Do NOT reverse-derive this from the
+                merged ``sensitive_key_patterns`` — compile it once at the
+                ``Memory`` boundary and pass it down.
         """
         self._store = store
         self._allowed_root = allowed_root
         self._key_patterns = sensitive_key_patterns
+        self._explicit_key_patterns = explicit_key_patterns
 
     def to_json(
         self,
@@ -190,7 +201,9 @@ class MemoryExporter:
             data = entry.to_dict()
             content_changed = False
         else:
-            verdict = is_sensitive_key(entry.key or "", self._key_patterns)
+            verdict = should_mask_content(
+                entry.key or "", entry.content, explicit_patterns=self._explicit_key_patterns
+            )
             data = entry.to_safe_dict(content_is_sensitive=verdict)
             data["content"] = redact_text(data["content"], key_patterns=self._key_patterns)
             content_changed = data["content"] != stored_content

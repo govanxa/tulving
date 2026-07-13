@@ -1120,6 +1120,108 @@ class TestForgetFamily:
 
 
 # ---------------------------------------------------------------------------
+# Maintenance CLI engine seams: store_stats / purgeable_count / vacuum
+# ---------------------------------------------------------------------------
+
+
+class TestMaintenanceSeams:
+    def test_store_stats_counts_match_seeded_data(self, memory: Memory) -> None:
+        store_fact(memory, "live one", key="k1")
+        forgotten = store_fact(memory, "will be forgotten", key="k2")
+        memory.forget_by_id(forgotten.id)
+        stats = memory.store_stats()
+        assert stats.live_count == 1
+        assert stats.archived_count == 1
+        assert stats.archived_by_reason[ArchiveReason.FORGOTTEN.value] == 1
+        assert stats.archived_by_reason[ArchiveReason.EVICTED.value] == 0
+        assert stats.total_count == 2
+        assert stats.db_bytes >= 0
+        assert stats.wal_bytes >= 0
+        assert stats.index_bytes == 0  # no embedder configured
+        assert stats.total_bytes == stats.db_bytes + stats.wal_bytes + stats.index_bytes
+        assert stats.schema_version >= 1
+        assert stats.embedding_model_id is None
+
+    def test_store_stats_all_reasons_present_when_empty(self, memory: Memory) -> None:
+        stats = memory.store_stats()
+        assert stats.live_count == 0
+        assert stats.archived_count == 0
+        assert set(stats.archived_by_reason) == {r.value for r in ArchiveReason}
+        assert all(count == 0 for count in stats.archived_by_reason.values())
+
+    def test_store_stats_legal_on_read_only_handle_and_takes_no_lock(self, tmp_path: Path) -> None:
+        path = tmp_path / "locked"
+        writer = Memory(path=str(path), agent_id="a")
+        try:
+            writer.store("x", type=MemoryType.FACT, key="k")
+            reader = Memory(path=str(path), agent_id="b", read_only=True)
+            try:
+                stats = reader.store_stats()
+                assert stats.live_count == 1
+            finally:
+                reader.close()
+        finally:
+            writer.close()
+
+    def test_store_stats_never_touches(self, memory: Memory) -> None:
+        entry = store_fact(memory, "untouched", key="k")
+        memory.store_stats()
+        raw = memory._store.get_by_id(entry.id, touch=False)
+        assert raw is not None
+        assert raw.access_count == 0
+
+    def test_purgeable_count_matches_store_count_archived(self, memory: Memory) -> None:
+        forgotten = store_fact(memory, "old", key="k")
+        memory.forget_by_id(forgotten.id)
+        assert memory.purgeable_count() == memory._store.count_archived()
+
+    def test_purgeable_count_is_read_only(self, memory: Memory) -> None:
+        forgotten = store_fact(memory, "old", key="k")
+        memory.forget_by_id(forgotten.id)
+        memory.purgeable_count()
+        assert memory.get_by_id(forgotten.id) is not None  # nothing deleted
+
+    def test_vacuum_requires_writable(self, tmp_path: Path) -> None:
+        path = tmp_path / "store"
+        writer = Memory(path=str(path), agent_id="a")
+        writer.store("x", type=MemoryType.FACT, key="k")
+        writer.close()
+        reader = Memory(path=str(path), agent_id="b", read_only=True)
+        try:
+            with pytest.raises(MemoryStoreError, match="read_only"):
+                reader.vacuum()
+        finally:
+            reader.close()
+
+    def test_vacuum_returns_result_with_reclaimed_bytes(self, tmp_path: Path) -> None:
+        path = tmp_path / "store"
+        handle = Memory(path=str(path), agent_id="a")
+        try:
+            big_content = "x" * 5000
+            for i in range(200):
+                handle.store(big_content, type=MemoryType.FACT, key=f"k{i}")
+            for i in range(200):
+                handle.forget(f"k{i}")
+            handle.purge_archived()
+            result = handle.vacuum()
+            assert result.bytes_before >= result.bytes_after
+            assert result.bytes_reclaimed == max(result.bytes_before - result.bytes_after, 0)
+            assert result.bytes_reclaimed > 0
+        finally:
+            handle.close()
+
+    def test_vacuum_on_tight_store_is_benign(self, tmp_path: Path) -> None:
+        path = tmp_path / "store"
+        handle = Memory(path=str(path), agent_id="a")
+        try:
+            handle.store("x", type=MemoryType.FACT, key="k")
+            result = handle.vacuum()
+            assert result.bytes_reclaimed >= 0
+        finally:
+            handle.close()
+
+
+# ---------------------------------------------------------------------------
 # Sessions & close
 # ---------------------------------------------------------------------------
 
@@ -1309,6 +1411,57 @@ class TestSecurity:
             pytest.skip("symlink creation not permitted on this platform/user")
         with pytest.raises(SecurityError):
             Memory(path=str(mem_dir), agent_id="a")
+
+    def test_user_declared_key_overlap_masks_unconditionally_via_curate(
+        self, tmp_path: Path, fake_clock: FakeClock
+    ) -> None:
+        """Cross-site, end-to-end through the real ``Memory`` wiring (v0.2
+        D-v02-7 Q3 mandatory overlap case): a user declares ``sensitive_keys=
+        ["auth-prod"]``, an entry's key ("auth-prod-token") ALSO matches a
+        built-in default ("auth"/"token"), and its content is plain prose
+        (NOT secret-shaped). The user's explicit declaration must still mask
+        unconditionally -- this exercises ``Memory.__init__``'s separate
+        ``compile_explicit_patterns`` threading into the real curator, not a
+        hand-constructed ``ContextCurator(explicit_key_patterns=...)`` (unit
+        tests in test_curator.py cover that in isolation; this is the
+        integration point those cannot see)."""
+        handle = make_memory(tmp_path, fake_clock, sensitive_keys=["auth-prod"])
+        try:
+            store_fact(
+                handle,
+                "rotate quarterly, no value here",
+                key="auth-prod-token",
+            )
+            result = handle.curate("auth", token_budget=500)
+            assert "rotate quarterly" not in result.content
+            assert "[REDACTED]" in result.content or "REDACTED" in result.content
+        finally:
+            handle.close()
+
+    def test_default_key_without_sensitive_keys_softening_applies_via_curate(
+        self, tmp_path: Path, fake_clock: FakeClock
+    ) -> None:
+        """Regression guard for a merge bug in ``Memory.__init__``'s explicit-
+        pattern threading: if ``self._explicit_key_patterns`` were ever set to
+        the MERGED (defaults + extras) ``self._key_patterns`` instead of
+        ``compile_explicit_patterns(sensitive_keys)``, EVERY default-sensitive
+        key (e.g. "token") would mask unconditionally for every ``Memory``
+        instance -- even with no ``sensitive_keys`` declared -- defeating the
+        v0.2 softening entirely. Plain prose under a default-sensitive key,
+        with no ``sensitive_keys`` argument at all, must pass through
+        ``curate()`` unmasked."""
+        handle = make_memory(tmp_path, fake_clock)
+        try:
+            store_fact(
+                handle,
+                "auth token TTL is 15 minutes and rotates automatically",
+                key="fact:auth-ttl",
+            )
+            result = handle.curate("auth", token_budget=500)
+            assert "auth token TTL is 15 minutes" in result.content
+            assert "REDACTED" not in result.content
+        finally:
+            handle.close()
 
 
 # ---------------------------------------------------------------------------

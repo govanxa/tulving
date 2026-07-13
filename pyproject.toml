@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tulving"
-version = "0.1.2"
+version = "0.2.0"
 description = "The context-budget engine for AI agents — persistent typed memory with token-budget curation."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -47,6 +47,7 @@ anthropic = [
 ]
 
 [project.scripts]
+tulving = "tulving.cli:main"
 tulving-mcp = "tulving.mcp.server:main"
 
 [project.urls]
@@ -75,6 +76,24 @@ files = ["tulving"]
 
 [[tool.mypy.overrides]]
 module = "hnswlib"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# numpy >= 2.5 stubs use PEP 695 `type` statements, which mypy rejects while
+# python_version = "3.11" (parse aborts before any project file is checked).
+# numpy enters the build only transitively (sentence_transformers, installed via
+# [local], is typed and imports it). Skip following so the gate works in a venv
+# that has [local] installed; CI (no [local]) never reaches numpy either way.
+module = ["numpy", "numpy.*"]
+follow_imports = "skip"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# sentence_transformers is typed-and-installed in a [local] venv, so
+# ignore_missing_imports alone does not stop mypy entering it (and pulling
+# numpy/torch stubs). D9: it is only imported inside gated adapter constructors.
+module = ["sentence_transformers", "sentence_transformers.*", "torch", "torch.*"]
+follow_imports = "skip"
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

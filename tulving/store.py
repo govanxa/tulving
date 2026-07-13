@@ -735,6 +735,39 @@ class MemoryStore:
                 self._archive_checked(entry_id, ArchiveReason.FORGOTTEN)
         return True
 
+    def _purge_filters(
+        self, reasons: _ReasonList | None, older_than: timedelta | None
+    ) -> dict[str, Any]:
+        """The filter dict shared by ``purge_archived`` and ``count_archived`` (DRY).
+
+        ``reasons=None`` defaults to everything EXCEPT ``SUMMARIZED``:
+        summarization sources (ADR-009 "originals recoverable") are matched
+        only when ``SUMMARIZED`` is explicitly listed. ``older_than`` filters
+        on ``updated_at`` — the ``archive()`` timestamp (the schema has no
+        ``archived_at`` column; the two are equivalent by construction).
+        """
+        selected = list(reasons) if reasons is not None else list(_DEFAULT_PURGE_REASONS)
+        filters: dict[str, Any] = {"archive_reasons": [r.value for r in selected]}
+        if older_than is not None:
+            filters["updated_before"] = (self._clock() - older_than).isoformat()
+        return filters
+
+    def count_archived(
+        self,
+        *,
+        reasons: _ReasonList | None = None,
+        older_than: timedelta | None = None,
+    ) -> int:
+        """Count rows ``purge_archived`` WOULD delete under the same filter (dry-run).
+
+        Read-only: never deletes, never touches. Backs the maintenance CLI's
+        ``--dry-run`` preview and confirmation prompt.
+
+        Returns:
+            The count of matching archived rows.
+        """
+        return self._backend.count(self._purge_filters(reasons, older_than))
+
     def purge_archived(
         self,
         *,
@@ -752,10 +785,7 @@ class MemoryStore:
         Returns:
             The number of rows deleted.
         """
-        selected = list(reasons) if reasons is not None else list(_DEFAULT_PURGE_REASONS)
-        filters: dict[str, Any] = {"archive_reasons": [r.value for r in selected]}
-        if older_than is not None:
-            filters["updated_before"] = (self._clock() - older_than).isoformat()
+        filters = self._purge_filters(reasons, older_than)
         with self._backend.transaction():
             total = self._backend.count(filters)
             if total == 0:

@@ -27,9 +27,9 @@ from tulving.exceptions import (
     VectorIndexError,
 )
 from tulving.export import ImportReport, MemoryExporter, MemoryImporter
-from tulving.memory import Memory, SearchResult, StartupReport
+from tulving.memory import Memory, SearchResult, StartupReport, StoreStats, VacuumResult
 
-__version__ = "0.1.2"
+__version__ = "0.2.0"
 
 __all__ = [
     "ArchiveReason",
@@ -58,7 +58,9 @@ __all__ = [
     "SourceInfo",
     "StartupReport",
     "StorageError",
+    "StoreStats",
     "TulvingError",
+    "VacuumResult",
     "VectorIndexError",
     "__version__",
 ]

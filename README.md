@@ -2,8 +2,8 @@
 
 > *The context-budget engine for AI agents.*
 
-**Status: stable on PyPI.** `pip install tulving` installs the current release. v0.2 is in
-development — see the [roadmap](#roadmap--coming-in-v02).
+**Status: stable on PyPI.** `pip install tulving` installs the current release — see
+[what's new](#whats-new-in-v02) and the [roadmap](#roadmap).
 
 Tulving is a model-agnostic Python SDK that gives an AI agent persistent, structured,
 searchable working memory — and, as its **headline capability**, curates that memory back
@@ -135,13 +135,27 @@ enables session summaries (needs `[anthropic]` + `ANTHROPIC_API_KEY`); with no L
 server degrades **loudly** to deterministic markers. A second process on the same path is
 refused (single-writer safety, ADR-015).
 
+Want the token-budget win with **no torch and no network**? Use `--embedding none`:
+
+```bash
+pip install "tulving[mcp]"          # no [local]/[openai] needed
+tulving-mcp --memory-path ./agent_memory --embedding none
+```
+
+`memory_store`/`memory_get`/`memory_curate`/`memory_forget`/`memory_list_keys` all work
+unchanged (exact-key + importance/recency curation); `memory_search` (semantic, by-meaning)
+is disabled and says so loudly rather than failing silently. Use `--embedding local`/`openai`
+when you need find-by-meaning.
+
 ---
 
 ## Export / import
 
 Full JSON round-trip for backup, migration, or sharing. Exports are an **emission surface**:
-redaction is **on by default** (secret-shaped tokens and sensitive keys are masked), with a
-loud keyword-only opt-out for trusted backups.
+redaction is **on by default** — secret-shaped tokens are always masked, and content under a
+key that *looks* sensitive (`auth`/`token`/`secret`/`password`/`key`/`credential`) is masked too
+whenever it also looks secret-shaped, or unconditionally if you declared that key pattern via
+`Memory(sensitive_keys=[...])`. A loud keyword-only opt-out remains for trusted backups.
 
 ```python
 # By default the export file must live inside the memory directory; pass
@@ -174,19 +188,35 @@ IDs/reference graph are consistently remapped.
 
 ---
 
-## Roadmap — coming in v0.2
+## What's new in v0.2
 
-Planned for the next release (**not yet available**):
+- **`tulving eval` — a value report.** Measures whether Tulving is actually helping *your* store,
+  read-only against the real data: how much `curate()` cuts context-token usage as memory grows
+  (dump-vs-curate reduction), plus optional answer-correctness scoring against a probe set via an
+  OpenAI-compatible endpoint (LM Studio, etc.). Every run appends to a JSON history log, rendered
+  as a self-contained **HTML trend report** (PDF via the browser's Print → Save as PDF).
 
-- **`tulving eval` — a value report.** Measure whether Tulving is actually helping *your* store over
-  time: how much `curate()` cuts context-token usage as your memory grows, plus answer correctness —
-  rendered as a self-contained **HTML / PDF trend report**.
-- **Torch-free offline MCP mode (`--embedding none`).** Run the MCP server with **no torch and no
-  network** — key-exact recall + importance/recency curation — for users who want token-budget
-  reduction without installing the local-embeddings stack. (Semantic "search by meaning" stays
-  available via `--embedding local` / `openai`.)
-- **`tulving maintenance` — housekeeping CLI.** `--inspect` / `--purge` / `--vacuum` / `--export`
-  to keep a long-lived store tidy on disk.
+  ```bash
+  tulving eval --store ./agent_memory --html report.html
+  ```
+
+- **Torch-free offline MCP mode (`--embedding none`).** See [MCP server](#mcp-server-claude-code--other-mcp-clients)
+  above — `pip install "tulving[mcp]"` alone is enough; no torch, no network.
+- **`tulving maintenance` — housekeeping CLI.** `inspect` / `purge` / `vacuum` / `export`
+  subcommands wrap the existing archive/purge/export engine so a long-lived store can be
+  inspected and reclaimed from the command line.
+- **Sensitive-key masking is content-aware.** A key named `auth`/`token`/`secret`/`password`/
+  `key`/`credential`-*like* no longer masks its entire content unconditionally — only when the
+  content also looks secret-shaped (or you declared the key explicitly via
+  `Memory(sensitive_keys=[...])`, which always masks). Ordinary prose under a key like
+  `fact:auth-ttl` now passes through; the CLI and MCP server have no `sensitive_keys` parameter
+  of their own, so their protection is the built-in defaults plus content shape only.
+
+## Roadmap
+
+Candidates under consideration, not committed: a `kairos-ai-tulving` integration package
+(contradiction detection via `kairos-ai-evidence`), full redaction parity for MCP's `memory_get`,
+a per-entry opt-out from content-shape masking, and a dedicated read-only storage-backend mode.
 
 Further out (ADR-016): knowledge graph, multi-agent machinery, semantic contradiction detection,
 Postgres backend, and additional export formats.
