@@ -1428,7 +1428,16 @@ class TestPragmas:
         blocker = sqlite3.connect(db, isolation_level=None)
         blocker.execute("BEGIN IMMEDIATE")
         try:
-            reader = SQLiteBackend(db)  # must not raise StorageError
+            # A short busy_timeout keeps this test fast: opening the new
+            # connection itself is near-instant (no write-requiring pragma
+            # runs against an existing, already-WAL database) -- the ~5.5s
+            # this test used to take came from close()'s best-effort
+            # `wal_checkpoint(TRUNCATE)`, which DOES need the write lock and
+            # so retries for the full busy_timeout while blocker still holds
+            # it, then suppresses the resulting sqlite3.Error. That retry
+            # window is what this timeout knob controls -- unrelated to the
+            # open-under-contention behavior the test is pinning.
+            reader = SQLiteBackend(db, busy_timeout_ms=50)  # must not raise StorageError
             reader.close()
         finally:
             blocker.rollback()
@@ -1811,4 +1820,80 @@ class TestVectorLabelsMigration:
         try:
             assert b.load_labels() == [(0, "e-a", True), (1, "e-b", False)]
         finally:
+            b.close()
+
+
+# ---------------------------------------------------------------------------
+# vacuum() — Protocol addition (maintenance CLI engine seam)
+# ---------------------------------------------------------------------------
+
+
+class TestVacuum:
+    """Parity: vacuum() exists on both backends (mypy Protocol conformance)."""
+
+    def test_closed_backend_raises(self, backend: Any) -> None:
+        backend.close()
+        with pytest.raises(StorageError, match="closed"):
+            backend.vacuum()
+
+    def test_open_backend_does_not_raise(self, backend: Any) -> None:
+        backend.create(make_row("e1"))
+        backend.vacuum()  # must not raise
+        assert backend.read("e1") is not None  # data survives
+
+
+class TestSqliteVacuumReclaim:
+    """SQLite-only: VACUUM must actually shrink the file after bulk deletes."""
+
+    def test_file_shrinks_after_deleting_many_rows(self, tmp_path: Path) -> None:
+        db = tmp_path / "t.db"
+        b = SQLiteBackend(db)
+        try:
+            big_content = "x" * 5000
+            ids = [f"e{i}" for i in range(200)]
+            b.create_batch([(make_row(entry_id, content=big_content), None) for entry_id in ids])
+            # A baseline vacuum forces the WAL-resident inserts onto disk (WAL
+            # mode defers writes to the -wal file until checkpointed) so
+            # size_before reflects real on-disk content, not just the header.
+            b.vacuum()
+            size_before = db.stat().st_size
+            b.delete_many(ids)
+            b.vacuum()
+            size_after = db.stat().st_size
+            assert size_after < size_before
+        finally:
+            b.close()
+
+    def test_raises_inside_transaction(self, sqlite_backend: SQLiteBackend) -> None:
+        with sqlite_backend.transaction():
+            with pytest.raises(StorageError, match="transaction"):
+                sqlite_backend.vacuum()
+
+    def test_raises_on_closed_backend(self, tmp_path: Path) -> None:
+        b = SQLiteBackend(tmp_path / "t.db")
+        b.close()
+        with pytest.raises(StorageError, match="closed"):
+            b.vacuum()
+
+    def test_genuine_sqlite_error_during_vacuum_wraps_as_storage_error(
+        self, tmp_path: Path
+    ) -> None:
+        """QA gap: the ``except sqlite3.Error`` wrap around the VACUUM
+        statement itself (not the in-txn guard, not the closed-backend guard)
+        was unexercised. A held write transaction on a second raw connection
+        denies VACUUM the exclusive lock it needs; with a short busy_timeout
+        SQLite surfaces a genuine ``database is locked`` OperationalError,
+        which must come back out as ``StorageError: VACUUM failed: ...``."""
+        db = tmp_path / "t.db"
+        b = SQLiteBackend(db, busy_timeout_ms=50)
+        blocker = sqlite3.connect(db, isolation_level=None)
+        try:
+            b.create(make_row("e1"))
+            blocker.execute("BEGIN IMMEDIATE")
+            blocker.execute("CREATE TABLE IF NOT EXISTS _blocker_touch (x)")
+            with pytest.raises(StorageError, match="VACUUM failed"):
+                b.vacuum()
+        finally:
+            blocker.rollback()
+            blocker.close()
             b.close()

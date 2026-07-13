@@ -15,6 +15,9 @@ EXPECTED_EXPORTS = {
     "SearchResult",
     "StartupReport",
     "LifecycleConfig",
+    # maintenance CLI engine seams (v0.2: tulving maintenance inspect/vacuum)
+    "StoreStats",
+    "VacuumResult",
     # curation (build step 10; headline primitive's return type)
     "CuratedContext",
     # JSON export/import (build step 15)

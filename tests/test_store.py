@@ -615,6 +615,47 @@ class TestPurge:
         assert store.count() == 2
 
 
+class TestCountArchived:
+    """count_archived is the dry-run twin of purge_archived — same filters, no delete."""
+
+    def _archive_one_per_reason(self, store: MemoryStore) -> dict[ArchiveReason, str]:
+        ids: dict[ArchiveReason, str] = {}
+        for reason in ArchiveReason:
+            entry = create_fact(store, content=f"for {reason.value}")
+            store.archive(entry.id, reason)
+            ids[reason] = entry.id
+        return ids
+
+    def test_matches_default_purge_count_and_deletes_nothing(
+        self, store: MemoryStore, backend: InMemoryBackend
+    ) -> None:
+        ids = self._archive_one_per_reason(store)
+        assert store.count_archived() == 4  # everything except SUMMARIZED
+        # count_archived never deletes.
+        for entry_id in ids.values():
+            assert backend.read(entry_id) is not None
+
+    def test_summarized_excluded_by_default_included_when_listed(self, store: MemoryStore) -> None:
+        self._archive_one_per_reason(store)
+        assert store.count_archived(reasons=[ArchiveReason.SUMMARIZED]) == 1
+
+    def test_older_than_honored(self, store: MemoryStore, fake_clock: Any) -> None:
+        early = create_fact(store, content="early")
+        late = create_fact(store, content="late")
+        store.archive(early.id, ArchiveReason.EVICTED)
+        fake_clock.advance(hours=10)
+        store.archive(late.id, ArchiveReason.EVICTED)
+        assert store.count_archived(older_than=timedelta(hours=5)) == 1
+
+    def test_equals_what_purge_archived_would_delete(
+        self, store: MemoryStore, backend: InMemoryBackend
+    ) -> None:
+        self._archive_one_per_reason(store)
+        expected = store.count_archived(reasons=[ArchiveReason.EVICTED])
+        deleted = store.purge_archived(reasons=[ArchiveReason.EVICTED])
+        assert deleted == expected
+
+
 # ---------------------------------------------------------------------------
 # Remaining CRUD
 # ---------------------------------------------------------------------------
