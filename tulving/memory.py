@@ -780,6 +780,32 @@ class Memory:
         """Whether this handle refuses writes (and never touches)."""
         return self._read_only
 
+    @property
+    def semantic_available(self) -> bool:
+        """Whether semantic (vector) retrieval is actually live on this handle.
+
+        ``True`` only when an embedding adapter is configured AND the semantic
+        index is open and enabled — the single flag (``_semantic_open``) that
+        every semantic-dependent code path in this class already consults
+        before touching the index (search, store's index delta, update's
+        re-embed, import's reconcile). It is ``False`` — not an error — for
+        every "semantic unavailable" condition this class recognizes: no
+        embedder configured, the read-only-diverged-cache path
+        (``_build_semantic_index``/``_run_startup``), and the
+        adapter-mismatch/unrecoverable-cache path that disables the index
+        during ``startup()``. In every ``False`` case, retrieval has already
+        silently degraded to KV-exact + recency — callers that need to know
+        *which* regime actually served a query (e.g. ``tulving eval``'s
+        history log) should read this property rather than infer it from
+        whether an embedding adapter was merely configured.
+
+        Before ``startup()`` has run, this is ``False`` (the pre-startup
+        default) even when an adapter is configured — call ``startup()``
+        (directly, or via any public method's lazy trigger) first if the
+        answer must reflect the index's real state.
+        """
+        return self._semantic is not None and self._semantic_open
+
     # ------------------------------------------------------- static helpers
 
     @staticmethod

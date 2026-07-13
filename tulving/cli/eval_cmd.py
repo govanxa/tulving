@@ -61,7 +61,38 @@ _parser: argparse.ArgumentParser | None = None
 
 @dataclass(frozen=True)
 class EvalRun:
-    """One history row (serializes 1:1 to the log's ``runs[]`` entries)."""
+    """One history row (serializes 1:1 to the log's ``runs[]`` entries).
+
+    ``retrieval`` (``"semantic"`` | ``"kv-only"``) records whether semantic
+    retrieval was ACTUALLY live for this run (``Memory.semantic_available``
+    at measurement time; see ``_open_store``/``run``) -- not merely whether
+    ``--embedding`` requested it. A stale/diverged ``.hnsw`` cache disables
+    the index loudly and degrades to KV-only even with ``--embedding local``
+    configured; without this field a row's ``embedding`` label would silently
+    misrepresent what was actually measured (the bug this field fixes).
+
+    ADDITIVE, no ``HISTORY_SCHEMA_VERSION`` bump (ruling D-v02-8, orchestrator,
+    2026-07-12): this format's version-COMPARISON contract exists to protect
+    the log's *parse shape* -- refusing to read a file whose ``schema_version``
+    is newer than this Tulving understands, so an older reader never
+    misinterprets a field it doesn't know about. ``retrieval`` is load-bearing
+    on WRITE, exactly like ``estimator``/``embedding`` (every row this module
+    produces from here on carries it, unconditionally) -- but it changes
+    nothing about how an OLDER reader parses a NEWER row: the field is simply
+    absent to that reader, which already tolerates absent/unknown fields
+    (``eval_report._estimator_footnote`` defaults a missing ``estimator`` to
+    ``"unknown"``, same convention this field's report-side reads follow).
+    Bumping ``HISTORY_SCHEMA_VERSION`` for this change would make a v0.2.0
+    install refuse to append to a v0.2.1-written log outright (the
+    newer-schema-version refusal in ``load_history``) for no protective
+    benefit -- there is no misparse to guard against, only a field an older
+    reader has never heard of and doesn't need to. The dataclass default below
+    exists only to satisfy in-process construction (this module is the sole
+    writer of ``EvalRun``); a genuinely OLDER on-disk row missing this field
+    is read back as a plain ``dict`` by ``load_history`` (never through this
+    dataclass) and defaults via ``eval_report.py``'s own
+    ``.get("retrieval", "unknown")``.
+    """
 
     timestamp: str
     store_path: str
@@ -76,6 +107,7 @@ class EvalRun:
     correctness: dict[str, str] | None
     model: str | None
     tulving_version: str
+    retrieval: str = "kv-only"
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to a JSON-safe plain dict (counts + metadata only)."""
@@ -93,6 +125,7 @@ class EvalRun:
             "correctness": self.correctness,
             "model": self.model,
             "tulving_version": self.tulving_version,
+            "retrieval": self.retrieval,
         }
 
 
@@ -194,6 +227,12 @@ def run(args: argparse.Namespace) -> int:
     except (MemoryStoreError, StorageError, ConfigError) as exc:
         emit(f"could not open store: {redact_text(str(exc))}", stream=sys.stderr)
         return EXIT_ERROR
+    # Recorded once, right after open/startup: whether semantic retrieval is
+    # ACTUALLY live on this handle, not merely whether --embedding requested
+    # it (a stale/diverged .hnsw cache disables the index loudly and degrades
+    # to KV-only -- see Memory.semantic_available's docstring). Never changes
+    # across this run: curate() calls below cannot make a disabled index live.
+    retrieval_label = "semantic" if mem.semantic_available else "kv-only"
 
     try:
         probes: list[dict[str, str]] = []
@@ -253,6 +292,7 @@ def run(args: argparse.Namespace) -> int:
             correctness=correctness,
             model=model_used,
             tulving_version=__version__,
+            retrieval=retrieval_label,
         )
         append_run(history_path, run_row)
 

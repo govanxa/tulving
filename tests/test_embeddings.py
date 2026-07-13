@@ -92,6 +92,45 @@ def fake_st(monkeypatch: pytest.MonkeyPatch) -> type[FakeSentenceTransformer]:
     return FakeSentenceTransformer
 
 
+class FakeSentenceTransformerNewAPI:
+    """Only exposes the new (>=5.x) ``get_embedding_dimension`` name.
+
+    Deliberately has NO ``get_sentence_embedding_dimension`` attribute at all,
+    so that any code path touching the old name fails honestly with
+    AttributeError instead of silently succeeding.
+    """
+
+    instances: ClassVar[list[FakeSentenceTransformerNewAPI]] = []
+
+    def __init__(self, model_name: str) -> None:
+        self.model_name = model_name
+        self.encode_calls: list[tuple[list[str], dict[str, Any]]] = []
+        FakeSentenceTransformerNewAPI.instances.append(self)
+
+    def get_embedding_dimension(self) -> int:
+        return 384
+
+    def encode(self, texts: list[str], **kwargs: Any) -> FakeEncodedArray:
+        self.encode_calls.append((list(texts), dict(kwargs)))
+        return FakeEncodedArray([[0.6, 0.8, 0.0] for _ in texts])
+
+
+class FakeSentenceTransformersModuleNewAPI:
+    """Fake module whose model only speaks the new dimension API."""
+
+    SentenceTransformer = FakeSentenceTransformerNewAPI
+
+
+@pytest.fixture
+def fake_st_new_api(monkeypatch: pytest.MonkeyPatch) -> type[FakeSentenceTransformerNewAPI]:
+    """Install a fake sentence_transformers module exposing only the new API name."""
+    FakeSentenceTransformerNewAPI.instances = []
+    monkeypatch.setitem(
+        sys.modules, "sentence_transformers", FakeSentenceTransformersModuleNewAPI()
+    )
+    return FakeSentenceTransformerNewAPI
+
+
 class FakeEmbeddingDatum:
     def __init__(self, index: int, embedding: list[float]) -> None:
         self.index = index
@@ -443,6 +482,28 @@ class TestLocalEmbedderBehavior:
         embedder = LocalEmbedder()
         assert embedder.dimension == 384
         assert len(fake_st.instances) == 1
+
+    def test_dimension_uses_old_api_name_when_only_that_is_present(
+        self, fake_st: type[FakeSentenceTransformer]
+    ) -> None:
+        """Compat shim: old sentence-transformers exposing only
+        ``get_sentence_embedding_dimension`` (no ``get_embedding_dimension``
+        at all) must still resolve the dimension."""
+        assert not hasattr(FakeSentenceTransformer, "get_embedding_dimension")
+        embedder = LocalEmbedder()
+        assert embedder.dimension == 384
+
+    def test_dimension_prefers_new_api_name_when_present(
+        self, fake_st_new_api: type[FakeSentenceTransformerNewAPI]
+    ) -> None:
+        """Compat shim: new sentence-transformers exposing only
+        ``get_embedding_dimension`` (no ``get_sentence_embedding_dimension``
+        at all, so touching the old name would raise AttributeError) must
+        resolve the dimension without a FutureWarning."""
+        assert not hasattr(FakeSentenceTransformerNewAPI, "get_sentence_embedding_dimension")
+        embedder = LocalEmbedder()
+        assert embedder.dimension == 384
+        assert len(fake_st_new_api.instances) == 1
 
     def test_dimension_none_raises_config_error_naming_model(
         self,

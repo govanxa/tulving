@@ -35,6 +35,7 @@ def _run(**overrides: Any) -> dict[str, Any]:
         "correctness": {"none": "0/3", "dump": "3/3", "curate": "3/3"},
         "model": "local-model",
         "tulving_version": "0.2.0",
+        "retrieval": "kv-only",
     }
     base.update(overrides)
     return base
@@ -132,6 +133,72 @@ class TestBasicBehavior:
         assert rows.count("<tr") == 2
 
 
+class TestRetrievalRegimeRendering:
+    """The `retrieval` field's HTML surfacing: per-row mode + the mixed-regime
+    footnote (parallel to `_estimator_footnote`) when the log mixes retrieval
+    modes under one embedding label (docs/specs/cli-eval.md)."""
+
+    def test_table_row_shows_retrieval_mode(self) -> None:
+        rows = table_rows([_run(retrieval="semantic")])
+        assert "semantic" in rows
+
+        rows_kv = table_rows([_run(retrieval="kv-only")])
+        assert "kv-only" in rows_kv
+
+    def test_table_row_shows_unknown_for_legacy_row(self) -> None:
+        legacy = _run()
+        del legacy["retrieval"]
+        rows = table_rows([legacy])
+        assert "unknown" in rows
+
+    def test_mixed_regime_footnote_absent_when_uniform(self) -> None:
+        runs = [
+            _run(embedding="local", retrieval="semantic"),
+            _run(embedding="local", retrieval="semantic", timestamp="2026-07-15T12:00:00+00:00"),
+        ]
+        html_out = render(runs)
+        assert "measured retrieval differently" not in html_out
+
+    def test_mixed_regime_footnote_present_when_same_embedding_mixes_modes(self) -> None:
+        """The bug's regression case: two runs both labeled embedding="local",
+        one measured with a live semantic index, one degraded to kv-only
+        (stale cache) -- the report must flag the mixed regime."""
+        runs = [
+            _run(embedding="local", retrieval="semantic"),
+            _run(embedding="local", retrieval="kv-only", timestamp="2026-07-15T12:00:00+00:00"),
+        ]
+        html_out = render(runs)
+        assert "measured retrieval differently" in html_out
+
+    def test_mixed_regime_footnote_scoped_per_embedding_label(self) -> None:
+        """A "none"/"local" split is NOT a retrieval-regime bug (embedding
+        itself differs, by design) -- only mixing WITHIN one embedding label
+        is the drift this footnote exists to catch."""
+        runs = [
+            _run(embedding="none", retrieval="kv-only"),
+            _run(embedding="local", retrieval="semantic", timestamp="2026-07-15T12:00:00+00:00"),
+        ]
+        html_out = render(runs)
+        assert "measured retrieval differently" not in html_out
+
+    def test_mixed_regime_footnote_absent_for_single_legacy_only_group(self) -> None:
+        """A group containing only `"unknown"` (all legacy rows) is one
+        distinct value, same convention as `_estimator_footnote` -- no
+        footnote, since there's no actual observed drift, just missing data."""
+        legacy_a, legacy_b = _run(embedding="local"), _run(embedding="local")
+        del legacy_a["retrieval"]
+        del legacy_b["retrieval"]
+        legacy_b["timestamp"] = "2026-07-15T12:00:00+00:00"
+        html_out = render([legacy_a, legacy_b])
+        assert "measured retrieval differently" not in html_out
+
+    def test_old_rows_without_retrieval_render_without_crashing(self) -> None:
+        legacy = _run()
+        del legacy["retrieval"]
+        html_out = render([legacy])
+        assert "<!doctype html>" in html_out.lower()
+
+
 class TestSecurity:
     def test_report_is_self_contained(self) -> None:
         runs = [_run(), _run(timestamp="2026-07-15T12:00:00+00:00")]
@@ -151,3 +218,13 @@ class TestSecurity:
         assert "<script>alert(1)</script>" not in html
         # Escaped forms are present somewhere (basename rendered, model rendered in panel).
         assert re.search(r"&lt;b&gt;store&lt;/b&gt;|&lt;script&gt;", html) is not None
+
+    def test_retrieval_is_html_escaped(self) -> None:
+        """reviewer LOW: `retrieval` reaches the report through a hand-editable
+        JSON log (untrusted relative to the report's own code) exactly like
+        `store_path`/`model` above -- a hostile value must render escaped,
+        never as live markup."""
+        runs = [_run(retrieval="<script>alert(1)</script>")]
+        html = render(runs)
+        assert "<script>alert(1)</script>" not in html
+        assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html
