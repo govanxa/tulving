@@ -23,6 +23,7 @@ from tulving.enums import ArchiveReason, MemoryType
 from tulving.exceptions import MemoryStoreError, SecurityError, StorageError
 from tulving.export import ImportReport as ReexportedImportReport
 from tulving.export.formats import ImportReport, MemoryExporter, MemoryImporter
+from tulving.security import compile_explicit_patterns
 from tulving.store import MemoryStore
 
 # --------------------------------------------------------------------------- #
@@ -181,6 +182,16 @@ class TestSecurity:
             exporter.to_json(str(outside / "backup.json"))
 
     def test_redaction_default_on(self, tmp_path: Path) -> None:
+        """Default-sensitive key + secret-SHAPED content -> whole-masked
+        (v0.2 softening, D-v02-7: the key alone is no longer enough).
+
+        The secret is embedded inside an unrelated sentence and the
+        SURROUNDING sentence is asserted absent too (test review MAJOR):
+        surgical redact_text alone would strip only the secret substring and
+        leave the sentence text intact, so this can only pass via true
+        whole-body masking."""
+        secret_value = "sk-" + "y" * 24
+        sentence = f"the rotation doc says {secret_value} expires monthly"
         store, _ = make_store()
         store.create(
             content="the token is sk-abcdefghijklmnopqrstuvwxyz012345",
@@ -188,7 +199,7 @@ class TestSecurity:
             source=SourceInfo(agent_id="a"),
         )
         store.create(
-            content="super secret value",
+            content=sentence,
             type=MemoryType.FACT,
             key="service_api_key",
             source=SourceInfo(agent_id="a"),
@@ -198,11 +209,65 @@ class TestSecurity:
         exporter.to_json(str(path))
         raw = path.read_text(encoding="utf-8")
         assert "sk-abcdefghijklmnopqrstuvwxyz012345" not in raw
-        assert "super secret value" not in raw
+        assert secret_value not in raw
+        assert "rotation doc says" not in raw
+        assert "expires monthly" not in raw
         assert "[REDACTED]" in raw
         envelope = json.loads(raw)
         assert envelope["redacted"] is True
         keyed = next(e for e in envelope["entries"] if e["key"] == "service_api_key")
+        assert keyed["content"] == "[REDACTED]"
+
+    def test_default_sensitive_key_prose_passes_through_and_keeps_embedding(
+        self, tmp_path: Path
+    ) -> None:
+        """The reported bug fix: prose under a default-sensitive-named key is
+        no longer whole-masked, and (vector-consistency rule) its embedding
+        is now RETAINED because the exported content is verbatim."""
+        store, backend = make_store()
+        embedder = RecordingEmbedder()
+        seed_meta(backend, embedder)
+        prose = store.create(
+            content="auth token TTL is 15 min",
+            type=MemoryType.FACT,
+            key="fact:auth-ttl",
+            source=SourceInfo(agent_id="a"),
+            embedding=pack_embedding(embedder._vector("prose")),
+        )
+        secret_value = "sk-" + "z" * 24
+        secret = store.create(
+            content=secret_value,
+            type=MemoryType.FACT,
+            key="api_key:x",
+            source=SourceInfo(agent_id="a"),
+            embedding=pack_embedding(embedder._vector("secret")),
+        )
+        exporter = MemoryExporter(store, allowed_root=tmp_path)
+        path = tmp_path / "out.json"
+        exporter.to_json(str(path), include_embeddings=True)
+        envelope = json.loads(path.read_text(encoding="utf-8"))
+        entries = {e["id"]: e for e in envelope["entries"]}
+        assert entries[prose.id]["content"] == "auth token TTL is 15 min"
+        assert entries[prose.id]["embedding"] is not None
+        assert entries[secret.id]["content"] == "[REDACTED]"
+        assert entries[secret.id]["embedding"] is None
+
+    def test_user_declared_key_overrides_default_overlap(self, tmp_path: Path) -> None:
+        """D-v02-7 Q3 (mandatory): a user-declared pattern masks unconditionally
+        even when the key ALSO matches a built-in default, and even for prose."""
+        store, _ = make_store()
+        store.create(
+            content="rotate quarterly, no value here",
+            type=MemoryType.FACT,
+            key="auth-prod-token",
+            source=SourceInfo(agent_id="a"),
+        )
+        explicit = compile_explicit_patterns(["auth-prod"])
+        exporter = MemoryExporter(store, allowed_root=tmp_path, explicit_key_patterns=explicit)
+        path = tmp_path / "out.json"
+        exporter.to_json(str(path))
+        envelope = json.loads(path.read_text(encoding="utf-8"))
+        keyed = next(e for e in envelope["entries"] if e["key"] == "auth-prod-token")
         assert keyed["content"] == "[REDACTED]"
 
     def test_opt_out_exports_verbatim(self, tmp_path: Path) -> None:
@@ -241,10 +306,11 @@ class TestSecurity:
             source=SourceInfo(agent_id="a"),
             embedding=pack_embedding(embedder._vector("y")),
         )
-        # A sensitive-KEY-masked entry: to_safe_dict blanks the whole content,
-        # so its vector must also be dropped (S3 — locks the key-masked branch).
+        # A sensitive-KEY-masked entry (secret-SHAPED content, v0.2 softening):
+        # to_safe_dict blanks the whole content, so its vector must also be
+        # dropped (S3 — locks the key-masked branch).
         key_masked = store.create(
-            content="ordinary looking content but key is sensitive",
+            content="sk-" + "q" * 24,
             type=MemoryType.FACT,
             key="service_api_key",
             source=SourceInfo(agent_id="a"),

@@ -592,7 +592,14 @@ class TestExport:
             type=MemoryType.FACT,
             key="note",
         )
-        writer.store("hunter2secretvalue", type=MemoryType.FACT, key="api_key")
+        # Secret-shaped content (v0.2 softening, D-v02-7): the CLI's
+        # _open_memory constructs Memory() with no sensitive_keys, so the
+        # unconditional user-declared-pattern tier is unreachable from this
+        # surface (deferred Q5 opt-out) — CLI export protection is built-in
+        # default keys + content shape only, so the fixture must look
+        # secret-shaped to keep proving redact-by-default through this path.
+        secret_value = "sk-" + "hunter2secretvalue" * 2
+        writer.store(secret_value, type=MemoryType.FACT, key="api_key")
         writer.close()
         monkeypatch.chdir(tmp_path)
         args = _parse_args(["export", "--store", str(path), "--out", "backup"])
@@ -603,7 +610,7 @@ class TestExport:
         payload = json.loads(text)
         assert payload["redacted"] is True
         assert "sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ01234567" not in text
-        assert "hunter2secretvalue" not in text
+        assert secret_value not in text
 
     def test_include_sensitive_opts_out(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]

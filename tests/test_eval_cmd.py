@@ -373,12 +373,26 @@ class TestBasicBehavior:
         assert "session marker content" not in dump_text
 
     def test_dump_is_redacted(self, tmp_path: Path) -> None:
+        """Default-sensitive key + secret-SHAPED content -> still whole-masked
+        (v0.2 softening, D-v02-7: the key alone is no longer enough).
+
+        The secret is embedded inside an unrelated sentence and the
+        SURROUNDING sentence is asserted absent too (test review MAJOR /
+        QA-strengthened, mirroring test_curator/test_summarizer/test_export's
+        equivalent sites): a byte-identical secret-only fixture cannot
+        distinguish true whole-body masking from ``redact_text``'s surgical
+        substring scrub alone, since the latter already strips the raw
+        secret value wherever it appears in the dump. Embedding it mid-
+        sentence means only the whole-mask branch in ``_build_dump`` removes
+        the surrounding prose."""
+        secret_value = "sk-" + "z" * 24
+        sentence = f"the rotation doc says {secret_value} expires monthly"
         store_path = _seed_writer_store(
             tmp_path,
             [("fact:a", "token sk-ABCDEFGHIJKLMNOPQRSTUVWX inline", MemoryType.FACT)],
         )
         writer = Memory(path=str(store_path), agent_id="default")
-        writer.store("super secret value", type=MemoryType.FACT, key="api_key:prod")
+        writer.store(sentence, type=MemoryType.FACT, key="api_key:prod")
         writer.close()
 
         reader = Memory(path=str(store_path), agent_id="default", read_only=True)
@@ -390,7 +404,30 @@ class TestBasicBehavior:
 
         assert "[REDACTED]" in dump_text
         assert "sk-ABCDEFGHIJKLMNOPQRSTUVWX" not in dump_text
-        assert "super secret value" not in dump_text
+        assert secret_value not in dump_text
+        assert "rotation doc says" not in dump_text
+        assert "expires monthly" not in dump_text
+
+    def test_dump_prose_under_sensitive_key_passes_through(self, tmp_path: Path) -> None:
+        """The reported bug fix, on the eval CLI's dump surface: a
+        default-sensitive-named key holding plain prose is no longer
+        whole-masked (v0.2 softening, D-v02-7). The CLI has no
+        ``sensitive_keys`` surface (deferred Q5), so this exercises the
+        built-in-default + content-shape path only."""
+        store_path = _seed_writer_store(tmp_path, [])
+        writer = Memory(path=str(store_path), agent_id="default")
+        writer.store("auth token TTL is 15 min", type=MemoryType.FACT, key="fact:auth-ttl")
+        writer.close()
+
+        reader = Memory(path=str(store_path), agent_id="default", read_only=True)
+        reader.startup()
+        try:
+            dump_text, _count = eval_cmd._build_dump(reader, compile_key_patterns())
+        finally:
+            reader.close()
+
+        assert "auth token TTL is 15 min" in dump_text
+        assert "[REDACTED]" not in dump_text
 
     def test_history_log_versioned_object_written(self, tmp_path: Path) -> None:
         history = tmp_path / "hist.json"

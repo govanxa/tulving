@@ -32,7 +32,7 @@ from tulving.context.summarizer import (
 from tulving.entry import MemoryEntry, SourceInfo
 from tulving.enums import ArchiveReason, MemoryType
 from tulving.exceptions import ConfigError, MemoryStoreError
-from tulving.security import compile_key_patterns
+from tulving.security import compile_explicit_patterns, compile_key_patterns
 from tulving.store import MemoryStore
 
 AGENT = "agent-1"
@@ -181,6 +181,7 @@ def make(
     estimator: Any = None,
     agent_id: str = AGENT,
     key_patterns: Any = None,
+    explicit_key_patterns: Any = None,
 ) -> MemorySummarizer:
     return MemorySummarizer(
         store=store,
@@ -191,6 +192,7 @@ def make(
         agent_id=agent_id,
         clock=clock,
         key_patterns=key_patterns,
+        explicit_key_patterns=explicit_key_patterns,
     )
 
 
@@ -934,6 +936,57 @@ class TestSecurity:
         assert llm.prompts, "expected at least one LLM call"
         for prompt in llm.prompts:
             assert "INLINESECRET42" not in prompt
+        assert any("[REDACTED]" in prompt for prompt in llm.prompts)
+
+    def test_default_sensitive_key_prose_passes_through(
+        self, store: MemoryStore, clock: FakeClock
+    ) -> None:
+        """v0.2 softening (D-v02-7): a default-sensitive-named key holding
+        plain prose is no longer whole-masked on LLM egress."""
+        put(store, "auth token TTL is 15 min", key="fact:auth-ttl")
+        llm = FakeLLM()
+        summarizer = make(store, clock, llm=llm)
+        summarizer.summarize()
+        assert llm.prompts, "expected at least one LLM call"
+        assert any("auth token TTL is 15 min" in prompt for prompt in llm.prompts)
+        assert not any("[REDACTED]" in prompt for prompt in llm.prompts)
+
+    def test_default_sensitive_key_secret_shaped_content_masks(
+        self, store: MemoryStore, clock: FakeClock
+    ) -> None:
+        """Default-sensitive key + secret-SHAPED content -> still whole-masked.
+
+        The secret is embedded inside an unrelated sentence and the
+        SURROUNDING sentence is asserted absent too (test review MAJOR):
+        surgical redact_text alone would strip only the secret substring and
+        leave the sentence text intact, so this can only pass via true
+        whole-body masking."""
+        secret = "sk-live-" + "x" * 24
+        content = f"the rotation doc says {secret} expires monthly"
+        put(store, content, key="api_key:prod")
+        llm = FakeLLM()
+        summarizer = make(store, clock, llm=llm)
+        summarizer.summarize()
+        assert llm.prompts, "expected at least one LLM call"
+        for prompt in llm.prompts:
+            assert secret not in prompt
+            assert "rotation doc says" not in prompt
+            assert "expires monthly" not in prompt
+        assert any("[REDACTED]" in prompt for prompt in llm.prompts)
+
+    def test_user_declared_key_overrides_default_overlap(
+        self, store: MemoryStore, clock: FakeClock
+    ) -> None:
+        """D-v02-7 Q3 (mandatory): a user-declared pattern masks unconditionally
+        even when the key ALSO matches a built-in default, and even for prose."""
+        put(store, "rotate quarterly, no value here", key="auth-prod-token")
+        llm = FakeLLM()
+        explicit = compile_explicit_patterns(["auth-prod"])
+        summarizer = make(store, clock, llm=llm, explicit_key_patterns=explicit)
+        summarizer.summarize()
+        assert llm.prompts, "expected at least one LLM call"
+        for prompt in llm.prompts:
+            assert "rotate quarterly" not in prompt
         assert any("[REDACTED]" in prompt for prompt in llm.prompts)
 
 

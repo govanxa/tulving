@@ -1412,6 +1412,57 @@ class TestSecurity:
         with pytest.raises(SecurityError):
             Memory(path=str(mem_dir), agent_id="a")
 
+    def test_user_declared_key_overlap_masks_unconditionally_via_curate(
+        self, tmp_path: Path, fake_clock: FakeClock
+    ) -> None:
+        """Cross-site, end-to-end through the real ``Memory`` wiring (v0.2
+        D-v02-7 Q3 mandatory overlap case): a user declares ``sensitive_keys=
+        ["auth-prod"]``, an entry's key ("auth-prod-token") ALSO matches a
+        built-in default ("auth"/"token"), and its content is plain prose
+        (NOT secret-shaped). The user's explicit declaration must still mask
+        unconditionally -- this exercises ``Memory.__init__``'s separate
+        ``compile_explicit_patterns`` threading into the real curator, not a
+        hand-constructed ``ContextCurator(explicit_key_patterns=...)`` (unit
+        tests in test_curator.py cover that in isolation; this is the
+        integration point those cannot see)."""
+        handle = make_memory(tmp_path, fake_clock, sensitive_keys=["auth-prod"])
+        try:
+            store_fact(
+                handle,
+                "rotate quarterly, no value here",
+                key="auth-prod-token",
+            )
+            result = handle.curate("auth", token_budget=500)
+            assert "rotate quarterly" not in result.content
+            assert "[REDACTED]" in result.content or "REDACTED" in result.content
+        finally:
+            handle.close()
+
+    def test_default_key_without_sensitive_keys_softening_applies_via_curate(
+        self, tmp_path: Path, fake_clock: FakeClock
+    ) -> None:
+        """Regression guard for a merge bug in ``Memory.__init__``'s explicit-
+        pattern threading: if ``self._explicit_key_patterns`` were ever set to
+        the MERGED (defaults + extras) ``self._key_patterns`` instead of
+        ``compile_explicit_patterns(sensitive_keys)``, EVERY default-sensitive
+        key (e.g. "token") would mask unconditionally for every ``Memory``
+        instance -- even with no ``sensitive_keys`` declared -- defeating the
+        v0.2 softening entirely. Plain prose under a default-sensitive key,
+        with no ``sensitive_keys`` argument at all, must pass through
+        ``curate()`` unmasked."""
+        handle = make_memory(tmp_path, fake_clock)
+        try:
+            store_fact(
+                handle,
+                "auth token TTL is 15 minutes and rotates automatically",
+                key="fact:auth-ttl",
+            )
+            result = handle.curate("auth", token_budget=500)
+            assert "auth token TTL is 15 minutes" in result.content
+            assert "REDACTED" not in result.content
+        finally:
+            handle.close()
+
 
 # ---------------------------------------------------------------------------
 # SQLite persistence round trip

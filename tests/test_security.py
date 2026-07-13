@@ -14,6 +14,9 @@ from tulving.exceptions import ConfigError, SecurityError
 from tulving.security import (
     DEFAULT_SENSITIVE_KEY_PATTERNS,
     REDACTED,
+    _content_looks_secret,
+    _has_opaque_token,
+    compile_explicit_patterns,
     compile_key_patterns,
     contain_path,
     credential_from_env,
@@ -21,6 +24,7 @@ from tulving.security import (
     redact_secrets,
     redact_text,
     reject_inline_credential,
+    should_mask_content,
     validate_leaf_name,
 )
 
@@ -476,3 +480,165 @@ class TestCredentialHappy:
     def test_credential_read_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("TULVING_TEST_SET", "value-from-env")
         assert credential_from_env("TULVING_TEST_SET", adapter_name="x") == "value-from-env"
+
+
+# ---------------------------------------------------------------------------
+# should_mask_content / compile_explicit_patterns / opaque-token softening
+# (v0.2 sensitive-key redaction softening, D-v02-7)
+# ---------------------------------------------------------------------------
+
+
+class TestShouldMaskContent:
+    def test_non_sensitive_key_never_masks(self) -> None:
+        assert should_mask_content("note", "AKIA1234567890ABCDEF") is False
+
+    def test_default_key_with_named_shape_masks(self) -> None:
+        assert should_mask_content("api_key", "here sk-" + "x" * 24) is True
+
+    def test_default_key_with_prose_does_not_mask(self) -> None:
+        """The reported bug: fact:auth-ttl prose no longer whole-masked."""
+        assert should_mask_content("auth", "auth token TTL is 15 min") is False
+
+    def test_default_key_with_opaque_token_masks(self) -> None:
+        assert should_mask_content("secret", "Ab3" + "kZ9qWvT1" * 4) is True
+
+    def test_user_declared_key_masks_unconditionally(self) -> None:
+        patterns = compile_explicit_patterns(["projectcode"])
+        assert (
+            should_mask_content("projectcode", "just some prose here", explicit_patterns=patterns)
+            is True
+        )
+
+    def test_user_declared_key_overrides_default_overlap(self) -> None:
+        """D-v02-7 Q3 (mandatory): explicit declaration wins even when the key
+        ALSO matches a built-in default ("token"/"auth"); prose still masks."""
+        patterns = compile_explicit_patterns(["auth-prod"])
+        assert (
+            should_mask_content(
+                "auth-prod-token",
+                "rotate quarterly, no value here",
+                explicit_patterns=patterns,
+            )
+            is True
+        )
+
+    def test_default_key_empty_content_not_masked(self) -> None:
+        assert should_mask_content("secret", "") is False
+
+    def test_explicit_patterns_none_falls_through_to_default(self) -> None:
+        assert should_mask_content("api_key", "prose", explicit_patterns=None) is False
+
+    # -- SEV-001 (mandatory): a real secret broken by ONE embedded whitespace
+    # char must still whole-mask under a sensitive key (repro: store("deploy
+    # secret is aB3...\nN8p...", key="secret:deploy") -> curate() leaked it).
+
+    def test_newline_broken_secret_masks(self) -> None:
+        content = "deploy secret is aB3dE6fG9hJ2kL5m\nN8pQ1rS4tU7vW0xY3zA6"
+        assert should_mask_content("secret:deploy", content) is True
+
+    def test_tab_broken_secret_masks(self) -> None:
+        content = "deploy secret is aB3dE6fG9hJ2kL5m\tN8pQ1rS4tU7vW0xY3zA6"
+        assert should_mask_content("secret:deploy", content) is True
+
+    def test_double_space_broken_secret_masks(self) -> None:
+        content = "deploy secret is aB3dE6fG9hJ2kL5m  N8pQ1rS4tU7vW0xY3zA6"
+        assert should_mask_content("secret:deploy", content) is True
+
+    def test_longer_prose_still_does_not_mask(self) -> None:
+        """False-positive guard: the adjacent-pair join must not turn ordinary
+        multi-word prose into a fake opaque token."""
+        assert should_mask_content("auth", "auth token TTL is 15 minutes and rotates") is False
+
+
+class TestContentLooksSecret:
+    def test_named_shape_true(self) -> None:
+        assert _content_looks_secret("here is AKIAIOSFODNN7EXAMPLE") is True
+
+    def test_kv_assignment_true(self) -> None:
+        assert _content_looks_secret("password = hunter2secret") is True
+
+    def test_opaque_token_true(self) -> None:
+        assert _content_looks_secret("aB3dE6fG9hJ2kL5mN8pQ1rS4") is True
+
+    def test_prose_false(self) -> None:
+        assert _content_looks_secret("auth token TTL is 15 min") is False
+
+    def test_git_sha_false(self) -> None:
+        """40-char lowercase-hex SHA has only 2 classes (D10 honored)."""
+        assert _content_looks_secret("e758ad8f3b2c1d4e5f6a7b8c9d0e1f2a3b4c5d6e") is False
+
+
+class TestHasOpaqueToken:
+    def test_empty_false(self) -> None:
+        assert _has_opaque_token("") is False
+
+    def test_short_token_false(self) -> None:
+        assert _has_opaque_token("Ab3xyz") is False
+
+    def test_long_lowercase_only_false(self) -> None:
+        assert _has_opaque_token("a" * 30) is False
+
+    def test_long_lower_digit_false(self) -> None:
+        """2-class (hex-like) token: named accepted-risk gap (D-v02-7 Q2)."""
+        assert _has_opaque_token("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3") is False
+
+    def test_long_three_class_true(self) -> None:
+        assert _has_opaque_token("aB3dE6fG9hJ2kL5mN8pQ1rS4tU7vW0") is True
+
+    def test_upper_digit_only_false(self) -> None:
+        assert _has_opaque_token("A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3") is False
+
+    def test_boundary_exactly_min_len(self) -> None:
+        token24 = "aB3dE6fG9hJ2kL5mN8pQ1rS4"
+        assert len(token24) == 24
+        assert _has_opaque_token(token24) is True
+        assert _has_opaque_token(token24[:-1]) is False
+
+    # -- SEV-001 (mandatory): adjacent-pair join catches a secret broken by
+    # exactly one embedded whitespace char (space/tab/newline/double-space
+    # all collapse identically under content.split()).
+
+    def test_single_space_broken_secret_true(self) -> None:
+        assert _has_opaque_token("aB3dE6fG9hJ2kL5m N8pQ1rS4tU7vW0xY3zA6") is True
+
+    def test_double_space_broken_secret_true(self) -> None:
+        assert _has_opaque_token("aB3dE6fG9hJ2kL5m  N8pQ1rS4tU7vW0xY3zA6") is True
+
+    def test_tab_broken_secret_true(self) -> None:
+        assert _has_opaque_token("aB3dE6fG9hJ2kL5m\tN8pQ1rS4tU7vW0xY3zA6") is True
+
+    def test_newline_broken_secret_true(self) -> None:
+        assert _has_opaque_token("aB3dE6fG9hJ2kL5m\nN8pQ1rS4tU7vW0xY3zA6") is True
+
+    def test_each_half_too_short_alone(self) -> None:
+        """Confirms the pair-join branch is what fires, not the per-token one:
+        neither half alone reaches _OPAQUE_MIN_LEN."""
+        assert _has_opaque_token("aB3dE6fG9hJ2kL5m") is False
+        assert _has_opaque_token("N8pQ1rS4tU7vW0xY3zA6") is False
+
+    def test_adjacent_prose_pair_does_not_trigger(self) -> None:
+        """False-positive guard: real prose's longest adjacent-pair join stays
+        far below _OPAQUE_MIN_LEN, so ordinary sentences never qualify."""
+        assert _has_opaque_token("auth token TTL is 15 minutes and rotates") is False
+
+    def test_multi_break_split_not_caught(self) -> None:
+        """Documents the residual scope: only ADJACENT-PAIR joins are checked
+        (not triples+) — a secret split across >=2 embedded breaks (3+
+        fragments, each fragment and each adjacent pair below the threshold)
+        is a named accepted risk, not covered by this fix."""
+        assert _has_opaque_token("aB3dE6fG kL5mN8pQ tU7vW0xY") is False
+
+
+class TestCompileExplicitPatterns:
+    def test_none_returns_none(self) -> None:
+        assert compile_explicit_patterns(None) is None
+
+    def test_empty_returns_none(self) -> None:
+        assert compile_explicit_patterns([]) is None
+
+    def test_compiles_literal_boundary(self) -> None:
+        patterns = compile_explicit_patterns(["a.b"])
+        assert patterns is not None
+        assert is_sensitive_key("a.b", patterns) is True
+        assert is_sensitive_key("aXb", patterns) is False
+        assert is_sensitive_key("password", patterns) is False

@@ -28,7 +28,7 @@ from tulving.context.decay import effective_importance as decay_effective_import
 from tulving.entry import MemoryEntry, SourceInfo
 from tulving.enums import MemoryType
 from tulving.exceptions import ConfigError
-from tulving.security import REDACTED, compile_key_patterns
+from tulving.security import REDACTED, compile_explicit_patterns, compile_key_patterns
 
 STALE_TAG = "potentially_stale"
 
@@ -721,23 +721,74 @@ class TestSecurity:
         assert REDACTED in result.content
 
     def test_sensitive_key_masks_content(self, retrieval: FakeRetrieval) -> None:
-        retrieval.add(make_entry("e1", "totally-secret-value", key="api_key:acme"))
+        """Default-sensitive key + secret-SHAPED content -> whole-masked
+        (v0.2 softening, D-v02-7: the key alone is no longer enough).
+
+        The secret is embedded inside an unrelated sentence and the
+        SURROUNDING sentence is asserted absent too — surgical redact_text
+        alone would strip only the secret substring and leave the sentence
+        text intact, so this can only pass via true whole-body masking (test
+        review MAJOR: distinguishes whole-mask from content-shape-only
+        scrubbing, which a byte-identical secret-only fixture cannot)."""
+        secret = "sk-" + "x" * 24
+        content = f"the rotation doc says {secret} expires monthly"
+        retrieval.add(make_entry("e1", content, key="api_key:acme"))
         retrieval.add(make_entry("e2", "bananas are curved", key="monkey_facts"))
         curator = make_curator(retrieval)
         result = curator.curate("", token_budget=500)
-        assert "totally-secret-value" not in result.content
+        assert secret not in result.content
+        assert "rotation doc says" not in result.content
+        assert "expires monthly" not in result.content
         assert REDACTED_CONTENT in result.content
         assert "bananas are curved" in result.content  # word-boundary negative control
 
+    def test_whitespace_broken_secret_still_masks(self, retrieval: FakeRetrieval) -> None:
+        """SEV-001 end-to-end repro: a real secret broken by ONE embedded
+        whitespace char (newline/tab/double-space) must not leak through
+        curate() under a sensitive key."""
+        variants = {
+            "\n": "deploy secret is aB3dE6fG9hJ2kL5m\nN8pQ1rS4tU7vW0xY3zA6",
+            "\t": "deploy secret is aB3dE6fG9hJ2kL5m\tN8pQ1rS4tU7vW0xY3zA6",
+            "  ": "deploy secret is aB3dE6fG9hJ2kL5m  N8pQ1rS4tU7vW0xY3zA6",
+        }
+        for label, content in variants.items():
+            r = FakeRetrieval()
+            r.add(make_entry("e1", content, key="secret:deploy"))
+            result = make_curator(r).curate("", token_budget=500)
+            assert "aB3dE6fG9hJ2kL5m" not in result.content, label
+            assert REDACTED_CONTENT in result.content, label
+
+    def test_sensitive_key_prose_passes_through(self, retrieval: FakeRetrieval) -> None:
+        """The reported bug fix: a default-sensitive-named key holding plain
+        prose is no longer whole-masked (v0.2 softening, D-v02-7)."""
+        retrieval.add(make_entry("e1", "auth token TTL is 15 min", key="fact:auth-ttl"))
+        curator = make_curator(retrieval)
+        result = curator.curate("", token_budget=500)
+        assert "auth token TTL is 15 min" in result.content
+        assert REDACTED_CONTENT not in result.content
+
     def test_custom_key_patterns_mask_camel_case(self, retrieval: FakeRetrieval) -> None:
+        """A user-declared pattern threaded as ``explicit_key_patterns`` masks
+        unconditionally (D-v02-7 Q3) even for camelCase defaults miss."""
         retrieval.add(make_entry("e1", "jwt-value-here", key="authToken"))
         patterns = compile_key_patterns(["authToken"])
-        curator = make_curator(retrieval, key_patterns=patterns)
+        explicit = compile_explicit_patterns(["authToken"])
+        curator = make_curator(retrieval, key_patterns=patterns, explicit_key_patterns=explicit)
         result = curator.curate("", token_budget=500)
         assert "jwt-value-here" not in result.content
         # Defaults miss camelCase: without the extras the content leaks through.
         default_result = make_curator(retrieval).curate("", token_budget=500)
         assert "jwt-value-here" in default_result.content
+
+    def test_user_declared_key_overrides_default_overlap(self, retrieval: FakeRetrieval) -> None:
+        """D-v02-7 Q3 (mandatory): a user-declared pattern masks unconditionally
+        even when the key ALSO matches a built-in default, and even for prose."""
+        retrieval.add(make_entry("e1", "rotate quarterly, no value here", key="auth-prod-token"))
+        explicit = compile_explicit_patterns(["auth-prod"])
+        curator = make_curator(retrieval, explicit_key_patterns=explicit)
+        result = curator.curate("", token_budget=500)
+        assert "rotate quarterly" not in result.content
+        assert REDACTED_CONTENT in result.content
 
     def test_truncation_cannot_resurrect_a_secret(self, retrieval: FakeRetrieval) -> None:
         content = words(30) + " password = hunter22 " + words(30, "z")
