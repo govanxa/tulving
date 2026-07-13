@@ -232,7 +232,14 @@ class LocalEmbedder:
                 (exotic models can return None). The model name in the message
                 is passed through ``redact_secrets`` first.
         """
-        value = self._model().get_sentence_embedding_dimension()
+        model = self._model()
+        # Compat shim: sentence-transformers renamed get_sentence_embedding_dimension()
+        # to get_embedding_dimension() (the old name now emits a FutureWarning and
+        # will be removed in a future major); prefer the new name when present.
+        if hasattr(model, "get_embedding_dimension"):
+            value = model.get_embedding_dimension()
+        else:
+            value = model.get_sentence_embedding_dimension()
         if value is None:
             raise ConfigError(
                 f"model '{redact_secrets(self._model_name)}' does not report a "
