@@ -245,6 +245,14 @@ def correctness_panel(runs: list[dict[str, Any]]) -> str:
     </section>"""
 
 
+def _retrieval_label(run: dict[str, Any]) -> str:
+    """``"semantic"`` / ``"kv-only"`` / ``"unknown"`` (legacy rows predating
+    the field), HTML-escaped. Mirrors ``_estimator_footnote``'s convention of
+    defaulting an absent field to ``"unknown"`` rather than guessing a value
+    this report was never told."""
+    return html.escape(str(run.get("retrieval", "unknown")))
+
+
 def table_rows(runs: list[dict[str, Any]]) -> str:
     """One dated ``<tr>`` per run."""
     rows: list[str] = []
@@ -261,7 +269,7 @@ def table_rows(runs: list[dict[str, Any]]) -> str:
             f"<td>{r.get('store_size', 0)}</td><td>{r.get('dump_tokens', 0):,}</td>"
             f"<td>{r.get('curate_tokens', 0):,}</td>"
             f'<td><span class="red">{(r.get("reduction", 0) or 0):g}x</span></td>'
-            f"<td>{corr_cell}</td></tr>"
+            f"<td>{corr_cell}</td><td>{_retrieval_label(r)}</td></tr>"
         )
     return "".join(rows)
 
@@ -318,6 +326,39 @@ def _estimator_footnote(runs: list[dict[str, Any]]) -> str:
     return (
         f'<p class="note-footnote">Token counts span more than one estimator ({names}); '
         "install <code>tiktoken</code> for a stable trend.</p>"
+    )
+
+
+def _retrieval_footnote(runs: list[dict[str, Any]]) -> str:
+    """Retrieval-regime-drift footnote -- the parallel note to
+    ``_estimator_footnote`` for the same "never silently mix regimes" law
+    (docs/specs/cli-eval.md).
+
+    ``embedding`` records what was CONFIGURED; ``retrieval`` records what was
+    ACTUALLY measured (``Memory.semantic_available`` at run time). A stale or
+    disabled semantic index degrades a "local"/"openai" run to KV-only
+    without changing its ``embedding`` label, so runs sharing one
+    ``embedding`` value can legitimately mix ``retrieval`` regimes. Renders
+    only when some ``embedding`` group in the log actually contains more than
+    one distinct ``retrieval`` value; a group with a single value -- even
+    ``"unknown"`` from rows that predate this field -- renders nothing, same
+    convention as ``_estimator_footnote``.
+    """
+    by_embedding: dict[str, set[str]] = {}
+    for r in runs:
+        embedding = str(r.get("embedding", "unknown"))
+        retrieval = str(r.get("retrieval", "unknown"))
+        by_embedding.setdefault(embedding, set()).add(retrieval)
+    mixed = sorted(embedding for embedding, modes in by_embedding.items() if len(modes) > 1)
+    if not mixed:
+        return ""
+    names = ", ".join(html.escape(embedding) for embedding in mixed)
+    return (
+        f'<p class="note-footnote">Runs under the same embedding mode ({names}) measured '
+        "retrieval differently (semantic vs. kv-only -- likely a stale or diverged "
+        "vector-index cache on some runs); treat those runs' trend as mixed regimes, "
+        "not a like-for-like comparison. Open the store with a writer and call "
+        "<code>rebuild_index(re_embed=True)</code> to bring the cache current.</p>"
     )
 
 
@@ -476,6 +517,7 @@ def render(runs: list[dict[str, Any]]) -> str:
     )
     badge_icon = check if tone == "good" else ""
     footnote = _estimator_footnote(runs)
+    retrieval_footnote = _retrieval_footnote(runs)
 
     return f"""<!doctype html>
 <html lang="en">
@@ -535,7 +577,8 @@ def render(runs: list[dict[str, Any]]) -> str:
       <p class="desc">One dated row per run. Twice a month builds the trend above.</p></div>
     <div class="table-scroll"><table>
       <thead><tr><th>Run date</th><th>Store size</th><th>Dump tokens</th>
-      <th>Curate tokens</th><th>Reduction</th><th>Correctness</th></tr></thead>
+      <th>Curate tokens</th><th>Reduction</th><th>Correctness</th>
+      <th>Retrieval</th></tr></thead>
       <tbody>{table_rows(runs)}</tbody>
     </table></div>
   </section>
@@ -553,6 +596,7 @@ def render(runs: list[dict[str, Any]]) -> str:
            too tight.</p></div>
     </div>
     {footnote}
+    {retrieval_footnote}
   </section>
 
   <footer>

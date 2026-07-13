@@ -18,6 +18,7 @@ import pytest
 
 import tulving.context.curator as curator_mod
 from tulving import Memory
+from tulving.adapters.embeddings import HashEmbedder
 from tulving.cli import _util, eval_cmd
 from tulving.context.curator import HeuristicEstimator
 from tulving.enums import MemoryType
@@ -554,6 +555,194 @@ class TestBasicBehavior:
         assert code == _util.EXIT_OK
         out = capsys.readouterr().out
         assert "fewer tokens" in out
+
+
+# ---------------------------------------------------------------------------
+# retrieval field (regime-mixing bug fix)
+# ---------------------------------------------------------------------------
+
+
+class TestRetrievalRegimeField:
+    """A history row's ``retrieval`` must reflect what was ACTUALLY measured
+    (``Memory.semantic_available``), never just what ``--embedding`` requested
+    -- the fix for a stale/diverged ``.hnsw`` cache silently mixing measurement
+    regimes under one ``embedding`` label (see docs/specs/cli-eval.md)."""
+
+    def test_kv_only_when_embedder_configured_but_index_disabled(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The reported bug's real trigger: an embedder IS configured
+        (--embedding local) but the cache has diverged (renamed/incompatible
+        adapter identity) -- startup() disables the index loudly and search
+        degrades to KV-only. The row must say "kv-only", not "semantic",
+        even though `embedding` still (correctly) says "local"."""
+
+        class RenamedEmbedder(HashEmbedder):
+            @property
+            def model_id(self) -> str:
+                return f"tulving/hash-embedder-v2-{self.dimension}"
+
+        store_path = tmp_path / "store"
+        writer = Memory(
+            path=str(store_path), agent_id="default", embedding_adapter=HashEmbedder(32)
+        )
+        writer.store("hello world", type=MemoryType.FACT, key="fact:a")
+        writer.close()
+
+        def fake_open_store(_path: str, agent_id: str, _embedding: str) -> Memory:
+            mem = Memory(
+                path=str(store_path),
+                agent_id=agent_id,
+                embedding_adapter=RenamedEmbedder(32),
+                read_only=True,
+            )
+            mem.startup()
+            assert mem.semantic_available is False  # arrangement sanity check
+            return mem
+
+        monkeypatch.setattr(eval_cmd, "_open_store", fake_open_store)
+        history = tmp_path / "h.json"
+        args = _parse_eval_args(
+            [
+                "--store",
+                str(store_path),
+                "--embedding",
+                "local",
+                "--history",
+                str(history),
+                "--html",
+                str(tmp_path / "r.html"),
+            ]
+        )
+        code = eval_cmd.run(args)
+        assert code == _util.EXIT_OK
+        row = json.loads(history.read_text(encoding="utf-8"))["runs"][0]
+        assert row["embedding"] == "local"
+        assert row["retrieval"] == "kv-only"
+
+    def test_semantic_when_index_is_actually_live(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        store_path = tmp_path / "store"
+        writer = Memory(
+            path=str(store_path), agent_id="default", embedding_adapter=HashEmbedder(32)
+        )
+        writer.store("hello world", type=MemoryType.FACT, key="fact:a")
+        writer.close()
+
+        def fake_open_store(_path: str, agent_id: str, _embedding: str) -> Memory:
+            mem = Memory(
+                path=str(store_path),
+                agent_id=agent_id,
+                embedding_adapter=HashEmbedder(32),
+                read_only=True,
+            )
+            mem.startup()
+            assert mem.semantic_available is True  # arrangement sanity check
+            return mem
+
+        monkeypatch.setattr(eval_cmd, "_open_store", fake_open_store)
+        history = tmp_path / "h.json"
+        args = _parse_eval_args(
+            [
+                "--store",
+                str(store_path),
+                "--embedding",
+                "local",
+                "--history",
+                str(history),
+                "--html",
+                str(tmp_path / "r.html"),
+            ]
+        )
+        code = eval_cmd.run(args)
+        assert code == _util.EXIT_OK
+        row = json.loads(history.read_text(encoding="utf-8"))["runs"][0]
+        assert row["retrieval"] == "semantic"
+
+    def test_real_open_store_records_semantic_when_index_live(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Integration (reviewer MEDIUM): drives the REAL `eval_cmd._open_store`
+        end to end -- unlike its sibling tests above, `_open_store` itself is
+        NOT monkeypatched. Only `tulving.LocalEmbedder` is substituted for the
+        zero-dependency `HashEmbedder`, the same torch-avoidance substitution
+        `test_embedding_none_default_no_torch_import` already uses, so this
+        stays torch-free while still exercising `_open_store`'s real
+        `Memory(..., read_only=True)` + `mem.startup()` sequence.
+
+        Regression-proven by construction: this test was run against a
+        temporarily mutilated `_open_store` with its `mem.startup()` call
+        deleted, confirmed to FAIL (`semantic_available` stays False pre-
+        startup, so `retrieval` recorded "kv-only" instead of "semantic"),
+        then the line was restored -- see the dev report for this batch."""
+        monkeypatch.setattr("tulving.LocalEmbedder", HashEmbedder)
+        store_path = tmp_path / "store"
+        writer = Memory(
+            path=str(store_path), agent_id="default", embedding_adapter=HashEmbedder(32)
+        )
+        writer.store("hello world", type=MemoryType.FACT, key="fact:a")
+        writer.close()
+
+        history = tmp_path / "h.json"
+        args = _parse_eval_args(
+            [
+                "--store",
+                str(store_path),
+                "--embedding",
+                "local",
+                "--history",
+                str(history),
+                "--html",
+                str(tmp_path / "r.html"),
+            ]
+        )
+        code = eval_cmd.run(args)
+        assert code == _util.EXIT_OK
+        row = json.loads(history.read_text(encoding="utf-8"))["runs"][0]
+        assert row["retrieval"] == "semantic"
+
+    def test_kv_only_default_when_no_embedder_configured(self, tmp_path: Path) -> None:
+        """--embedding none (default): no adapter at all -- retrieval is
+        genuinely kv-only, unrelated to the disabled-cache bug."""
+        store_path = _seed_writer_store(tmp_path, [("fact:a", "hello", MemoryType.FACT)])
+        history = tmp_path / "h.json"
+        args = _parse_eval_args(
+            [
+                "--store",
+                str(store_path),
+                "--history",
+                str(history),
+                "--html",
+                str(tmp_path / "r.html"),
+            ]
+        )
+        code = eval_cmd.run(args)
+        assert code == _util.EXIT_OK
+        row = json.loads(history.read_text(encoding="utf-8"))["runs"][0]
+        assert row["embedding"] == "none"
+        assert row["retrieval"] == "kv-only"
+
+    def test_old_rows_without_retrieval_field_load_without_error(self, tmp_path: Path) -> None:
+        """Loaders must tolerate old rows lacking `retrieval` (additive field,
+        no schema_version bump) -- `load_history`/`append_run` never choke on
+        a legacy row missing the key."""
+        history = tmp_path / "hist.json"
+        legacy_row = _default_run().to_dict()
+        del legacy_row["retrieval"]
+        history.write_text(
+            json.dumps({"schema_version": eval_cmd.HISTORY_SCHEMA_VERSION, "runs": [legacy_row]}),
+            encoding="utf-8",
+        )
+
+        runs = eval_cmd.load_history(history)
+        assert runs == [legacy_row]
+        assert "retrieval" not in runs[0]
+
+        eval_cmd.append_run(history, _default_run())
+        payload = json.loads(history.read_text(encoding="utf-8"))
+        assert payload["runs"][0] == legacy_row  # untouched
+        assert payload["runs"][1]["retrieval"] == "kv-only"  # new row carries it
 
 
 # ---------------------------------------------------------------------------

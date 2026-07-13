@@ -1653,6 +1653,70 @@ class TestConstructorEdges:
             holder.close()
 
 
+class TestSemanticAvailableProperty:
+    """``Memory.semantic_available`` (SDK seam for tulving/cli/eval_cmd.py):
+    reflects whether semantic retrieval is actually live, not merely
+    configured — see the property's own docstring for the full state map."""
+
+    def test_false_when_no_embedder_configured(self, tmp_path: Path, fake_clock: FakeClock) -> None:
+        handle = make_memory(tmp_path, fake_clock)  # no embedding_adapter, no semantic_index
+        try:
+            handle.startup()
+            assert handle.semantic_available is False
+        finally:
+            handle.close()
+
+    def test_false_before_startup_even_with_embedder(
+        self, tmp_path: Path, fake_clock: FakeClock, fake_semantic: FakeSemanticIndex
+    ) -> None:
+        handle = make_memory(tmp_path, fake_clock, semantic=fake_semantic)
+        try:
+            # Never call startup() (or any public method that lazily triggers it).
+            assert handle.semantic_available is False
+        finally:
+            handle.close()
+
+    def test_true_once_index_is_open_and_healthy(
+        self, memory: Memory, fake_clock: FakeClock
+    ) -> None:
+        store_fact(memory, "triggers startup lazily")  # store() calls _ensure_started
+        assert memory.semantic_available is True
+
+    def test_false_when_index_disabled_by_startup_reconcile_failure(
+        self, tmp_path: Path, fake_clock: FakeClock, fake_semantic: FakeSemanticIndex
+    ) -> None:
+        """Mirrors the reported bug's real trigger: an embedder IS configured
+        (embedding="local"-equivalent) but the index fails to come up clean
+        (stale/divergent cache) -- ``startup()`` disables it loudly and search
+        degrades to KV-only. The property must say False here, not just when
+        no embedder was configured at all."""
+        fake_semantic.open_error = "cache diverged from the active adapter"
+        handle = make_memory(tmp_path, fake_clock, semantic=fake_semantic)
+        try:
+            report = handle.startup()
+            assert any("index_reconcile" in err for err in report.errors)
+            assert handle.semantic_available is False
+            # And retrieval genuinely degrades to KV-only, corroborating the flag.
+            store_fact(handle, "kv only now", key="k")
+            assert handle.search("kv only now") == []
+            assert handle.get("k") is not None
+        finally:
+            handle.close()
+
+    def test_true_again_after_rebuild_index_recovers(
+        self, tmp_path: Path, fake_clock: FakeClock, fake_semantic: FakeSemanticIndex
+    ) -> None:
+        fake_semantic.open_error = "cache diverged from the active adapter"
+        handle = make_memory(tmp_path, fake_clock, semantic=fake_semantic)
+        try:
+            handle.startup()
+            assert handle.semantic_available is False
+            handle.rebuild_index(re_embed=True)
+            assert handle.semantic_available is True
+        finally:
+            handle.close()
+
+
 class TestStartupAfterClose:
     def test_startup_and_rebuild_after_close_raise(
         self, tmp_path: Path, fake_clock: FakeClock
