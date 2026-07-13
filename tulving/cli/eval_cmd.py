@@ -35,7 +35,7 @@ from tulving.cli.eval_scoring import AnswerScorer, load_probes, score_probes
 from tulving.context.curator import TokenEstimator, resolve_estimator
 from tulving.exceptions import ConfigError, MemoryStoreError, StorageError, TulvingError
 from tulving.security import REDACTED as _REDACTED_BODY
-from tulving.security import compile_key_patterns, is_sensitive_key, redact_text
+from tulving.security import compile_key_patterns, redact_text, should_mask_content
 
 NAME: Final[str] = "eval"
 HISTORY_SCHEMA_VERSION: Final[int] = 1
@@ -309,8 +309,13 @@ def _build_dump(mem: Memory, key_patterns: Sequence[Pattern[str]]) -> tuple[str,
 
     Skips reserved ``session:`` lifecycle markers (internal session-history rows, not
     memories an agent would dump into a prompt). Mirrors the curator's redaction:
-    mask the body of any sensitive-keyed entry, then scan the whole block with
-    ``redact_text`` (security req #1).
+    ``should_mask_content`` masks the body whole when it looks secret-shaped under a
+    default-sensitive key (v0.2 softening, D-v02-7), then ``redact_text`` scans the
+    whole block regardless (security req #1). ``explicit_patterns=None`` always: this
+    CLI's ``_open_memory`` constructs ``Memory()`` with no ``sensitive_keys``, so the
+    unconditional user-declared-pattern tier is unreachable from this surface
+    (deferred Q5 opt-out) — CLI dump protection is built-in default keys + content
+    shape only.
     """
     lines: list[str] = []
     for key in mem.list_keys():
@@ -319,7 +324,11 @@ def _build_dump(mem: Memory, key_patterns: Sequence[Pattern[str]]) -> tuple[str,
         entry = mem.get(key)
         if entry is None:
             continue
-        body = _REDACTED_BODY if is_sensitive_key(entry.key or "", key_patterns) else entry.content
+        body = (
+            _REDACTED_BODY
+            if should_mask_content(entry.key or "", entry.content, explicit_patterns=None)
+            else entry.content
+        )
         lines.append(f"[{entry.type.value}] {entry.key} {body}")
     dump = redact_text("\n".join(lines), key_patterns=key_patterns)
     return dump, len(lines)

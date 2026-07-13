@@ -72,7 +72,12 @@ from tulving.exceptions import (
 )
 from tulving.export import ImportReport, MemoryExporter, MemoryImporter
 from tulving.kv_index import KVIndex
-from tulving.security import compile_key_patterns, contain_path, redact_text
+from tulving.security import (
+    compile_explicit_patterns,
+    compile_key_patterns,
+    contain_path,
+    redact_text,
+)
 from tulving.semantic_index import ReconcileReport, SemanticIndex
 from tulving.store import MemoryStore
 
@@ -603,7 +608,12 @@ class Memory:
                 rollups). ``None`` degrades loudly (warning + visible digest),
                 never silently.
             storage_backend: Injected backend; None opens SQLite in ``path``.
-            sensitive_keys: Extra sensitive-key patterns for redaction.
+            sensitive_keys: Extra sensitive-key patterns for redaction. Merged
+                with the built-in defaults for the surgical ``redact_text``
+                scrub AND compiled separately as explicit-only patterns
+                (v0.2 D-v02-7 Q3): a match on THESE always whole-masks the
+                entry's content unconditionally, even when the key also
+                matches a built-in default.
             lifecycle: Policy knobs; None uses ``LifecycleConfig()`` defaults.
             read_only: Skip the writer lock; refuse writes, never touch,
                 never create/migrate anything (a nonexistent store is
@@ -688,6 +698,11 @@ class Memory:
             )
             self._config = lifecycle if lifecycle is not None else LifecycleConfig()
             self._key_patterns = compile_key_patterns(sensitive_keys)
+            # ONLY the user-declared patterns (v0.2 D-v02-7 Q3): threaded
+            # SEPARATELY from the merged self._key_patterns so a user
+            # declaration masks unconditionally, even on overlap with a
+            # built-in default. Never merge these two sets.
+            self._explicit_key_patterns = compile_explicit_patterns(sensitive_keys)
             # Consumed by the MemorySummarizer (summarize() + end-of-session
             # rollups). None degrades loudly there — never called elsewhere.
             self._llm = llm_adapter
@@ -1303,6 +1318,7 @@ class Memory:
                         self._evaluator,
                         token_safety_margin=self._config.token_safety_margin,
                         key_patterns=self._key_patterns,
+                        explicit_key_patterns=self._explicit_key_patterns,
                         estimator=estimator,
                         now_fn=self._clock,
                     )
@@ -1352,6 +1368,7 @@ class Memory:
                         self._agent_id,
                         self._clock,
                         key_patterns=self._key_patterns,
+                        explicit_key_patterns=self._explicit_key_patterns,
                     )
                 summarizer = self._summarizer_impl
         return summarizer
@@ -1696,7 +1713,8 @@ class Memory:
 
         Assembles a :class:`MemoryExporter` over this handle's store, compiled
         sensitive-key patterns (so the user's ``sensitive_keys`` reach the
-        export surface — security req #1), and containment root (default: the
+        export surface — security req #1, threaded both merged AND
+        explicit-only per D-v02-7 Q3), and containment root (default: the
         memory directory). Redaction is ON unless ``include_sensitive=True``.
 
         Args:
@@ -1715,6 +1733,7 @@ class Memory:
             self._store,
             allowed_root=allowed_root if allowed_root is not None else self._memory_dir,
             sensitive_key_patterns=self._key_patterns,
+            explicit_key_patterns=self._explicit_key_patterns,
         )
         exporter.to_json(
             path,

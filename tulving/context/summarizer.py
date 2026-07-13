@@ -17,9 +17,10 @@ Key contracts (blueprint-summarizer):
   ``last_accessed_at``/``access_count``. **D2:** importance is only read
   (truncation ordering), never written.
 - **Security (req #1 / ADR-010):** prompt text leaves the process, so every
-  entry body is redacted (sensitive keys -> ``[REDACTED]``, token shapes
-  scrubbed) before ``complete()`` — and the fallback digest gets the same
-  treatment.
+  entry body is redacted (``should_mask_content`` verdict -> ``[REDACTED]``
+  when content looks secret-shaped under a sensitive key, or the key is
+  user-declared; token shapes always scrubbed) before ``complete()`` — and
+  the fallback digest gets the same treatment (v0.2 softening, D-v02-7).
 
 As-built deviations from blueprint-summarizer (both forced by landed code):
 
@@ -46,7 +47,7 @@ from tulving.context.config import LifecycleConfig
 from tulving.entry import MemoryEntry, SourceInfo, utcnow
 from tulving.enums import ArchiveReason, MemoryType
 from tulving.exceptions import ConfigError, MemoryStoreError
-from tulving.security import REDACTED, is_sensitive_key, redact_text
+from tulving.security import REDACTED, redact_text, should_mask_content
 from tulving.store import MemoryStore
 
 logger = logging.getLogger("tulving.summarizer")
@@ -115,6 +116,7 @@ class MemorySummarizer:
         clock: Callable[[], datetime] = utcnow,
         *,
         key_patterns: Sequence[re.Pattern[str]] | None = None,
+        explicit_key_patterns: Sequence[re.Pattern[str]] | None = None,
     ) -> None:
         """Cheap constructor (D8): store references, validate nothing expensive.
 
@@ -131,10 +133,16 @@ class MemorySummarizer:
             decay: Effective-importance reader used ONLY to order truncation.
             agent_id: Identity stamped into every summary's ``SourceInfo`` (D7).
             clock: Injectable now-source (tests never sleep).
-            key_patterns: Compiled sensitive-key patterns from
-                ``Memory(sensitive_keys=...)``; None uses the security
-                defaults. Needed so user-augmented redaction reaches LLM
-                egress (security req #1).
+            key_patterns: Compiled sensitive-key patterns (defaults + any
+                ``Memory(sensitive_keys=...)`` extras) used for the surgical
+                ``redact_text`` scrub; None uses the security defaults.
+                Needed so user-augmented redaction reaches LLM egress
+                (security req #1).
+            explicit_key_patterns: ONLY the user-declared
+                ``Memory(sensitive_keys=...)`` patterns (``compile_explicit_
+                patterns``), threaded SEPARATELY so a user declaration masks
+                unconditionally even on overlap with a built-in default
+                (D-v02-7 Q3). ``None`` when the caller declared none.
 
         Raises:
             ConfigError: On an empty ``agent_id`` (D7: identity is
@@ -151,6 +159,9 @@ class MemorySummarizer:
         self._clock: Callable[[], datetime] = clock
         self._key_patterns: tuple[re.Pattern[str], ...] | None = (
             tuple(key_patterns) if key_patterns is not None else None
+        )
+        self._explicit_key_patterns: tuple[re.Pattern[str], ...] | None = (
+            tuple(explicit_key_patterns) if explicit_key_patterns is not None else None
         )
 
     # ------------------------------------------------------------- public API
@@ -383,8 +394,12 @@ class MemorySummarizer:
         return entry.key if entry.key is not None else entry.id
 
     def _content_for(self, entry: MemoryEntry) -> str:
-        """Redacted content: sensitive keys mask entirely, token shapes scrub."""
-        if is_sensitive_key(entry.key or "", self._key_patterns):
+        """Redacted content: secret-shaped content under a sensitive key (or
+        any user-declared key, unconditionally) masks entirely; token shapes
+        are always surgically scrubbed."""
+        if should_mask_content(
+            entry.key or "", entry.content, explicit_patterns=self._explicit_key_patterns
+        ):
             return REDACTED
         return redact_text(entry.content, key_patterns=self._key_patterns)
 

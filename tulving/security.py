@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 import re
 from collections.abc import Iterable, Sequence
+from itertools import pairwise
 from pathlib import Path
 from typing import Final
 
@@ -96,16 +97,28 @@ _WINDOWS_RESERVED: Final[frozenset[str]] = frozenset(
 _LEAF_RE: Final[re.Pattern[str]] = re.compile(r"^[a-zA-Z0-9_-]{1,128}$")
 
 
+def _compile_one(name: str) -> re.Pattern[str]:
+    """Compile one literal key name with alphanumeric-boundary lookarounds.
+
+    ``name`` becomes ``(?<![a-zA-Z0-9])name(?![a-zA-Z0-9])`` (matched
+    case-insensitively) with ``name`` escaped via ``re.escape()`` — treated as
+    a literal, never as regex. Underscore, hyphen, dot, and string edges
+    therefore count as boundaries ("api_key" matches "key"); adjacent letters
+    do not ("monkey" does not match "key").
+
+    Shared by :func:`compile_key_patterns` and :func:`compile_explicit_patterns`
+    to keep the boundary/escaping rule in exactly one place.
+    """
+    return re.compile(rf"(?<![a-zA-Z0-9]){re.escape(name)}(?![a-zA-Z0-9])", re.IGNORECASE)
+
+
 def compile_key_patterns(
     extra_patterns: Iterable[str] | None = None,
 ) -> tuple[re.Pattern[str], ...]:
     """Compile sensitive-key patterns with alphanumeric-boundary lookarounds.
 
-    Each pattern ``p`` becomes ``(?<![a-zA-Z0-9])p(?![a-zA-Z0-9])`` (matched
-    case-insensitively) with ``p`` escaped via ``re.escape()`` — user-supplied
-    extras are treated as literals, never as regex. Underscore, hyphen, dot,
-    and string edges therefore count as boundaries ("api_key" matches "key");
-    adjacent letters do not ("monkey" does not match "key").
+    Each pattern is compiled via :func:`_compile_one` — user-supplied extras
+    are treated as literals, never as regex.
 
     Known limitation: camelCase ("authToken") does not match — callers pass
     their own ``sensitive_keys`` for that convention.
@@ -120,10 +133,31 @@ def compile_key_patterns(
     names: tuple[str, ...] = DEFAULT_SENSITIVE_KEY_PATTERNS
     if extra_patterns is not None:
         names += tuple(extra_patterns)
-    return tuple(
-        re.compile(rf"(?<![a-zA-Z0-9]){re.escape(name)}(?![a-zA-Z0-9])", re.IGNORECASE)
-        for name in names
-    )
+    return tuple(_compile_one(name) for name in names)
+
+
+def compile_explicit_patterns(
+    sensitive_keys: Iterable[str] | None,
+) -> tuple[re.Pattern[str], ...] | None:
+    """Compile ONLY user-declared key names (no built-in defaults).
+
+    Uses the identical alphanumeric-boundary lookaround + ``re.escape`` as
+    :func:`compile_key_patterns` (shared via :func:`_compile_one`). Returns
+    ``None`` when ``sensitive_keys`` is ``None`` or empty, so callers pass it
+    straight through as ``should_mask_content(explicit_patterns=...)``.
+
+    Args:
+        sensitive_keys: The caller's ``Memory(sensitive_keys=[...])`` names.
+
+    Returns:
+        Compiled explicit-only patterns, or ``None`` when there are none.
+    """
+    if sensitive_keys is None:
+        return None
+    names = tuple(sensitive_keys)
+    if not names:
+        return None
+    return tuple(_compile_one(name) for name in names)
 
 
 _DEFAULT_KEY_PATTERNS: Final[tuple[re.Pattern[str], ...]] = compile_key_patterns()
@@ -164,6 +198,130 @@ def is_sensitive_key(
     if patterns is None:
         patterns = _DEFAULT_KEY_PATTERNS
     return any(pattern.search(key) for pattern in patterns)
+
+
+# Opaque-token heuristic (key-gated fail-closed catch; D-v02-7 Q1).
+# NOT a general entropy detector: runs ONLY inside should_mask_content, after a
+# DEFAULT-sensitive-key match, never against arbitrary content. >=3 classes
+# deliberately excludes hex git-SHAs and UUIDs (lower+digit = 2 classes).
+_OPAQUE_MIN_LEN: Final[int] = 24
+_OPAQUE_MIN_CLASSES: Final[int] = 3
+
+
+def _qualifies_as_opaque(candidate: str) -> bool:
+    """True if ``candidate`` alone is >= ``_OPAQUE_MIN_LEN`` chars mixing
+    >= ``_OPAQUE_MIN_CLASSES`` of {lowercase, uppercase, digit}."""
+    if len(candidate) < _OPAQUE_MIN_LEN:
+        return False
+    classes = 0
+    if any(c.islower() for c in candidate):
+        classes += 1
+    if any(c.isupper() for c in candidate):
+        classes += 1
+    if any(c.isdigit() for c in candidate):
+        classes += 1
+    return classes >= _OPAQUE_MIN_CLASSES
+
+
+def _has_opaque_token(content: str) -> bool:
+    """True if content contains a raw credential, whole or whitespace-broken.
+
+    Qualifies (via :func:`_qualifies_as_opaque`) when either:
+
+    1. Any single whitespace-delimited token is long/mixed enough on its own
+       (the original check), or
+    2. Any two ADJACENT tokens, joined with the separating whitespace removed,
+       are long/mixed enough (SEV-001 fix: a real secret broken by exactly one
+       embedded space/tab/newline/double-space defeats both this scan's own
+       per-token split AND ``redact_secrets``'s whitespace-free ``\\b``-bounded
+       shape regexes — ``content.split()`` collapses any run of whitespace to
+       one separator, so a single-space, double-space, tab, or newline break
+       is caught identically by this adjacent-pair join).
+
+    Scoped deliberately to ADJACENT pairs only (not arbitrary n-grams): this
+    catches the reported single-break evasion without scanning whole
+    sentences for an accidental multi-word match — ordinary prose essentially
+    never has two adjacent words whose concatenation mixes 3 character
+    classes at >=24 characters (verified against the audit's prose corpus,
+    e.g. "auth token TTL is 15 minutes and rotates" — longest adjacent-pair
+    join is 10 chars). A secret split across >=2 embedded whitespace breaks
+    is a residual, named accepted risk (mirrors the existing 2-class gap).
+
+    Hex SHAs / UUIDs (2 classes) and ordinary prose never qualify. Pure;
+    never raises.
+
+    Args:
+        content: Arbitrary text to scan token-by-token and pairwise.
+
+    Returns:
+        Whether an opaque long, multi-class token (whole or pair-joined)
+        was found.
+    """
+    tokens = content.split()
+    for token in tokens:
+        if _qualifies_as_opaque(token):
+            return True
+    return any(_qualifies_as_opaque(left + right) for left, right in pairwise(tokens))
+
+
+def _content_looks_secret(content: str) -> bool:
+    """True if ``content`` has a recognized secret shape or an opaque token.
+
+    Reuses ``redact_secrets``: if that scanner would change the text, a known
+    shape is present. Otherwise falls back to the key-gated opaque-token
+    heuristic. Pure; never raises.
+
+    Args:
+        content: Arbitrary text (NOT a pre-redacted copy).
+
+    Returns:
+        Whether the content looks secret-shaped.
+    """
+    if redact_secrets(content) != content:
+        return True
+    return _has_opaque_token(content)
+
+
+def should_mask_content(
+    key: str,
+    content: str,
+    *,
+    explicit_patterns: Sequence[re.Pattern[str]] | None = None,
+) -> bool:
+    """Decide whether an entry's ENTIRE content must be masked to ``[REDACTED]``.
+
+    Softens the v0.1 name-only rule (v0.2-scope §2 / D-v02-7). Fails CLOSED.
+
+    Rule (evaluated in order):
+      1. Key matches a USER-DECLARED pattern (``explicit_patterns``) -> True,
+         UNCONDITIONALLY (D-v02-7 Q3). An explicit declaration is the strongest
+         signal and is never weakened by overlap with a built-in default.
+      2. Key matches a built-in DEFAULT pattern -> mask ONLY if the content
+         also looks secret-shaped (``_content_looks_secret``). This is the
+         softening.
+      3. Otherwise -> False (surgical ``redact_text`` still runs at the call
+         site; content shapes are scrubbed regardless of this verdict).
+
+    Note: built-in defaults are the fixed module set (``_DEFAULT_KEY_PATTERNS``);
+    they are NOT passed in, so overlap between a user pattern and a default is
+    resolved by rule 1 winning.
+
+    Args:
+        key: The entry key (pass ``entry.key or ""``).
+        content: The entry's raw content (NOT a pre-redacted copy).
+        explicit_patterns: The caller's user-declared patterns compiled via
+            ``compile_explicit_patterns(sensitive_keys)`` (``None`` when the
+            caller declared none).
+
+    Returns:
+        True to mask the whole content; False to leave it for surgical
+        scrubbing.
+    """
+    if explicit_patterns is not None and any(p.search(key) for p in explicit_patterns):
+        return True
+    if is_sensitive_key(key, _DEFAULT_KEY_PATTERNS):
+        return _content_looks_secret(content)
+    return False
 
 
 def redact_secrets(text: str) -> str:

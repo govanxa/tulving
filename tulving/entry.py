@@ -224,10 +224,12 @@ class MemoryEntry:
     def to_safe_dict(self, *, content_is_sensitive: bool) -> dict[str, Any]:
         """``to_dict()`` with content masked when the caller judged it sensitive.
 
-        The JUDGMENT (``security.is_sensitive_key``) lives in security.py,
+        The JUDGMENT (``security.should_mask_content``) lives in security.py,
         which this module may not import — so the caller passes the verdict::
 
-            e.to_safe_dict(content_is_sensitive=is_sensitive_key(e.key or ""))
+            e.to_safe_dict(
+                content_is_sensitive=should_mask_content(e.key or "", e.content)
+            )
 
         Content-level secret scanning of outgoing text is applied later by the
         emitting module (curator/export/MCP) via ``security.redact_text``.

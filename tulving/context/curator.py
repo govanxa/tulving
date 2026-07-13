@@ -9,7 +9,7 @@ leaves the module. It also owns cold-start orientation (``mode="orient"``).
 Imports: stdlib + ``tulving.enums`` (``MemoryType``, ``MatchType``),
 ``tulving.entry`` (``MemoryEntry``, ``utcnow``), ``tulving.exceptions``
 (``ConfigError``), ``tulving.security`` (``redact_text``,
-``is_sensitive_key``). Optional at runtime, guarded, lazy: ``tiktoken``.
+``should_mask_content``). Optional at runtime, guarded, lazy: ``tiktoken``.
 NEVER hnswlib, never an LLM adapter, never sqlite (blueprint-curator).
 
 Decisions honored:
@@ -24,8 +24,10 @@ Decisions honored:
 - **D6** — bad budgets, unknown modes, and invalid weights raise
   ``ConfigError``. No builtin-shadowing names.
 - **D10 / security #1** — every emitted block passes through
-  ``security.redact_text``; entries whose key is sensitive have their
-  content masked entirely.
+  ``security.redact_text``; entries whose content ``should_mask_content``
+  judges secret (secret-shaped content under a default-sensitive key, or any
+  user-declared ``sensitive_keys`` match, unconditionally) have their content
+  masked entirely (v0.2 softening, D-v02-7).
 - **D12** — the only lifecycle number the curator owns is its recency
   half-life (a ranking knob). Half-lives live behind the evaluator; the
   safety margin arrives as a wired scalar.
@@ -46,7 +48,7 @@ from typing import Final, Protocol
 from tulving.entry import MemoryEntry, utcnow
 from tulving.enums import MatchType, MemoryType
 from tulving.exceptions import ConfigError
-from tulving.security import is_sensitive_key, redact_text
+from tulving.security import redact_text, should_mask_content
 
 logger = logging.getLogger("tulving.curator")
 
@@ -258,6 +260,7 @@ class ContextCurator:
         token_safety_margin: float = 0.15,
         recency_half_life_hours: float = 168.0,
         key_patterns: Sequence[re.Pattern[str]] | None = None,
+        explicit_key_patterns: Sequence[re.Pattern[str]] | None = None,
         estimator: TokenEstimator | None = None,
         semantic_top_k: int = 20,
         recent_limit: int = 10,
@@ -273,8 +276,14 @@ class ContextCurator:
                 by ``memory.py`` (canonical default 0.15, architecture §3).
             recency_half_life_hours: Curator-local recency ranking knob
                 (spec §3.3: 168 h); must be ``> 0``.
-            key_patterns: Compiled sensitive-key patterns from
-                ``Memory(sensitive_keys=...)``; ``None`` uses security defaults.
+            key_patterns: Compiled sensitive-key patterns (defaults + any
+                ``Memory(sensitive_keys=...)`` extras) used for the surgical
+                ``redact_text`` scrub; ``None`` uses security defaults.
+            explicit_key_patterns: ONLY the user-declared
+                ``Memory(sensitive_keys=...)`` patterns (``compile_explicit_
+                patterns``), threaded SEPARATELY so a user declaration masks
+                unconditionally even on overlap with a built-in default
+                (D-v02-7 Q3). ``None`` when the caller declared none.
             estimator: Token estimator; ``None`` resolves lazily via
                 :func:`resolve_estimator` (tiktoken → heuristic).
             semantic_top_k: Semantic candidate fetch size; must be ``>= 1``.
@@ -304,6 +313,7 @@ class ContextCurator:
         self._token_safety_margin = token_safety_margin
         self._recency_half_life_hours = recency_half_life_hours
         self._key_patterns = key_patterns
+        self._explicit_key_patterns = explicit_key_patterns
         self._preferred_estimator = estimator
         self._resolved_estimator: TokenEstimator | None = None
         self._semantic_top_k = semantic_top_k
@@ -644,9 +654,11 @@ class ContextCurator:
     def _render_parts(self, cand: _Candidate, now: datetime) -> tuple[str, str]:
         """Redacted (header_line, body) for an entry.
 
-        Sensitive-keyed entries render ``REDACTED_CONTENT`` for the body; every
-        part is then scanned by ``redact_text`` (content shapes + labelled
-        values) before it is ever estimated or emitted.
+        Entries whose content is judged secret (``should_mask_content``:
+        secret-shaped content under a default-sensitive key, or ANY
+        user-declared key unconditionally) render ``REDACTED_CONTENT`` for
+        the body; every part is then scanned by ``redact_text`` (content
+        shapes + labelled values) before it is ever estimated or emitted.
         """
         entry = cand.entry
         if _STALE_TAG in entry.tags:
@@ -656,7 +668,9 @@ class ContextCurator:
             key = entry.key or ""
             age = self._coarse_age(now, entry.last_accessed_at or entry.created_at)
             header = f"[{entry.type.name}] {key} (importance: {cand.effective:.1f}, {age})"
-        if is_sensitive_key(entry.key or "", self._key_patterns):
+        if should_mask_content(
+            entry.key or "", entry.content, explicit_patterns=self._explicit_key_patterns
+        ):
             body = REDACTED_CONTENT
         else:
             body = entry.content
