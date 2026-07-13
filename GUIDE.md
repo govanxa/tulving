@@ -158,27 +158,27 @@ Tulving ships a thin, **local-only** (stdio, no network) MCP server exposing six
 `memory_store`, `memory_get`, `memory_search`, `memory_curate`, `memory_forget`,
 `memory_list_keys` (orient = `memory_curate(mode="orient")`).
 
-> **The MCP server requires an embedder to start** — `--embedding local` or `--embedding openai`
-> (it defaults to `local`; there is **no** torch-free / zero-dependency embedder over MCP in v0.1):
+> **Choose an embedder for the MCP server** via `--embedding {local,openai,none}` — it defaults to
+> `local` (flipping the default to `none` would silently strip semantic search from existing
+> installs, so `none` is opt-in):
 > - **`--embedding local`** — fully offline, but installs `sentence-transformers` **+ `torch`
->   (several hundred MB)**. This is what local-LLM / LM Studio users want:
->   `pip install "tulving[mcp,local]"`.
+>   (several hundred MB)**. This is what local-LLM / LM Studio users want if they also need
+>   semantic search: `pip install "tulving[mcp,local]"`.
 > - **`--embedding openai`** — avoids torch, but sends your memory text to OpenAI to compute
 >   embeddings (**not offline**; needs `OPENAI_API_KEY` + network):
 >   `pip install "tulving[mcp,openai]"`.
+> - **`--embedding none`** (v0.2, torch-free) — **no torch, no network, nothing beyond
+>   `pip install "tulving[mcp]"`.** Runs on exact-key lookup + importance/recency curation:
+>   `memory_store`, `memory_get`, `memory_curate`, `memory_forget`, and `memory_list_keys` all work
+>   normally, and `curate()`'s token-budget reduction is fully available. `memory_search`
+>   (semantic, by-meaning) is **disabled** and returns a loud, explicit `ToolError` explaining why
+>   and how to enable it, rather than silently degrading — this is the accepted tradeoff. The right
+>   fit if all you want is token-budget reduction and don't need find-by-meaning.
 >
 > **This is independent of the MCP host.** Claude Code and LM Studio are both just *hosts* — they
 > spawn the server and let their model call the tools; neither supplies embeddings. So the same
-> choice, and the same torch requirement for an offline setup, applies to **both**. There is **no
-> Anthropic/Claude embedder**, and `--llm claude` powers Tulving's *own* summaries (not
-> embeddings) — it does **not** remove the torch requirement.
-
-> **Coming in v0.2 — torch-free MCP.** If all you want is `curate`'s token-budget reduction and you
-> don't need semantic search (find-by-meaning), note that v0.1 still forces a `local` (torch) or
-> `openai` embedder just to *start* the server. v0.2 will add an **embedder-free mode**
-> (`--embedding none`) — exact-key + importance/recency curation with **no torch and no network** —
-> the right fit for token-reduction-only users on LM Studio or Claude Code. Until then, use
-> `[mcp,local]` (offline, torch) or `[mcp,openai]` (cloud, no torch).
+> choice applies to **both**. There is **no Anthropic/Claude embedder**, and `--llm claude` powers
+> Tulving's *own* summaries (not embeddings) — it has no effect on which `--embedding` you need.
 
 #### Do I have to tell the model "remember this" every time?
 
@@ -215,10 +215,10 @@ gate every write yourself.
 - **LM Studio** with a **tool-calling-capable** model loaded (e.g. a Qwen2.5-Instruct or
   Llama-3.1-Instruct "tools"/"function-calling" model — a model without tool support cannot
   call MCP tools).
-- `pip install "tulving[mcp,local]"`. The MCP server needs an embedder; `[local]` runs fully
-  offline but installs `sentence-transformers` **+ `torch` (several hundred MB)** and downloads a
-  ~90 MB embedding model on first run. (To avoid torch, use `--embedding openai` instead — cloud,
-  needs a key; see §4.)
+- `pip install "tulving[mcp,local]"`. `[local]` runs fully offline but installs
+  `sentence-transformers` **+ `torch` (several hundred MB)** and downloads a ~90 MB embedding model
+  on first run. To avoid torch entirely, use `--embedding none` (offline, but no semantic search —
+  `pip install "tulving[mcp]"` alone) or `--embedding openai` (cloud, needs a key); see §4.
 
 **Wire Tulving in.** LM Studio is an MCP host: it launches MCP servers and lets the loaded model
 call their tools. Add Tulving to its MCP config (in the app, edit `mcp.json`; LM Studio uses the
@@ -314,13 +314,19 @@ sequence with exact arguments and the exact responses Tulving returns:
 | 8 | `memory_forget` | `{"key":"fact:session-ttl"}` | `Archived memory with key 'fact:session-ttl'` |
 | 9 | `memory_get` | `{"key":"fact:session-ttl"}` | `No memory found for key 'fact:session-ttl'.` (archived ≠ retrievable) |
 
-> **Watch your key names.** The keys above deliberately avoid the words `auth`, `token`, `secret`,
-> `password`, `key`, and `credential`. Tulving treats a key containing any of those as naming a
-> secret and **masks the whole content as `[REDACTED]`** on every emission surface (get, curate,
-> export) — a safety default, but a surprise if you keyed a non-secret `fact:auth-ttl`. Use neutral
-> keys (`fact:session-ttl`, `decision:api-scheme`, `decision:login-flow`) for ordinary memories;
-> the content itself is never redacted for containing the word "auth", only the *key* matters. This
-> is a known sharp edge slated for softening in v0.2.
+> **Watch your key names — but it's no longer all-or-nothing (v0.2).** Tulving still treats a key
+> containing `auth`, `token`, `secret`, `password`, `key`, or `credential` as naming a secret, but
+> it now only **masks the whole content as `[REDACTED]`** when the content *also* looks
+> secret-shaped (a recognized token pattern, or an opaque run of ≥24 characters mixing letter case
+> and digits) on every emission surface (get, curate, export). Ordinary prose under a key like
+> `fact:auth-ttl` now passes through unmasked; a real credential under any key still masks. If you
+> want a key to mask unconditionally regardless of content shape, declare it explicitly via
+> `Memory(sensitive_keys=[...])` — declared patterns always win. Two notes: the CLI (`tulving eval`
+> / `tulving maintenance`) and the MCP server have no `sensitive_keys` parameter of their own, so
+> their protection is the built-in defaults plus content shape only; and short/low-entropy secrets
+> (fewer than 3 character classes, or under 24 characters) can still slip through the shape check —
+> a documented residual, not a bug. Neutral keys (`fact:session-ttl`, `decision:api-scheme`,
+> `decision:login-flow`) remain good practice regardless.
 
 What each tool is for:
 
@@ -428,8 +434,9 @@ memory.store("Chose JWT (RS256) for auth.", type=MemoryType.DECISION,
 ```
 
 (Note the key is `decision:api-scheme`, not `decision:auth` — a key containing `auth`/`token`/
-`secret`/`password`/`key`/`credential` gets its content masked as `[REDACTED]`. Tags are never
-redacted, so `tags: ["auth"]` is fine.)
+`secret`/`password`/`key`/`credential` gets its content masked as `[REDACTED]` if the content also
+looks secret-shaped (v0.2 softening — see [§4c](#4c-mcp-inspector--tool-reference)). Tags are
+never redacted, so `tags: ["auth"]` is fine.)
 
 **Filter by tags / prefix when recalling:**
 
@@ -597,6 +604,32 @@ print("\nCorrect:", {k: f"{v}/{len(PROBES)}" for k, v in score.items()})
 Scale the seed to hundreds of entries and condition **B** starts failing (truncation, lost in the
 middle, window overflow) while **C** holds. That is Tulving's value, quantified.
 
+### 6c. `tulving eval` — the automated value report (v0.2)
+
+The two scripts above are useful to read once; `tulving eval` is the packaged, repeatable version
+— run it every couple of weeks against your **real** store instead of a synthetic seed:
+
+```bash
+tulving eval --store ./agent_memory --html report.html
+```
+
+It opens your store **read-only** (never mutates, safe alongside a live MCP server), measures
+dump-vs-`curate()` token cost on your actual memories (the same `reduction = dump ÷ curate` metric
+as §6a, computed with the shared token estimator), and — if you pass `--probes probes.json`
+(question + expected-substring pairs; `--init-probes` writes a starter file) — scores answer
+correctness against an OpenAI-compatible endpoint (LM Studio's `http://localhost:1234/v1` by
+default, or `--lm-url`/`--model` for something else), matching §6b's none/dump/curate comparison.
+
+Every run appends one dated row to a JSON history log (`--history`, default `eval_history.json`)
+— that log **is** the trend — and renders it into a self-contained `report.html` (inline CSS/SVG,
+no external assets; open it in a browser, Print → Save as PDF for a shareable snapshot). Both the
+log and the report are **counts-only**: token counts, reduction ratios, and pass/fail correctness —
+never memory content — and the report shows only your store's basename, not the full path.
+
+`--embedding` defaults to `none` (works everywhere, no extras needed); pass `local`/`openai` to
+measure with the same embedder your MCP server uses — each history row records which one, so
+trends never silently mix measurement regimes.
+
 ---
 
 ## 7. Storage model & platform support
@@ -698,8 +731,30 @@ reclaim path for it.
 **Manual — only when the DB file itself gets large.** Tulving *archives, never destroys* (D2):
 every supersede, forget, and eviction leaves an `archived = 1` row behind, so `tulving.db` grows
 with your total write history even though the active set stays lean. For a per-project store this
-is slow (tens of MB over a long time, not runaway). When you want to reclaim it — with Tulving
-**stopped** (single-writer rule), from the SDK:
+is slow (tens of MB over a long time, not runaway). Reclaim it with Tulving **stopped**
+(single-writer rule).
+
+**`tulving maintenance` (v0.2) — the primary route.** Four subcommands wrap the same engine:
+
+```bash
+tulving maintenance inspect --store ./agent_memory                     # counts, sizes, meta
+tulving maintenance export  --store ./agent_memory --out backup.json   # 1. safety backup first
+tulving maintenance purge   --store ./agent_memory --older-than 90d    # 2. drop old archived rows
+tulving maintenance vacuum  --store ./agent_memory                     # 3. reclaim file size
+```
+
+`purge` shares `purge_archived`'s reason-awareness — it **refuses to delete summarization-source
+entries** unless you pass `--include-summarized` (or `--reason summarized`) explicitly, so
+compressing sessions into summaries never silently loses the sources; it also refuses to purge
+*everything* with no age cutoff unless you pass `--older-than DURATION` (e.g. `30d`/`12h`/`2w`) or
+force it with `--all`. `--dry-run` previews the row count without deleting anything. Destructive
+ops (`purge`, `vacuum`) prompt for confirmation unless you pass `--yes` for scripting; with no TTY
+and no `--yes`, they refuse rather than run unattended. `DECISION`/pinned entries are never
+eviction targets in the first place, so a purge of archived rows can't remove a live decision.
+Exit codes: `0` ok, `1` runtime error, `2` bad arguments, `3` the store is locked by another
+process — see `tulving maintenance --help` and each subcommand's `--help`.
+
+**Or from the SDK** — the same operations, useful in a scheduled job:
 
 ```python
 from datetime import timedelta
@@ -712,19 +767,12 @@ m.export_json("backup.json", allowed_root=".",              # 1. safety backup f
               include_archived=True, include_sensitive=True)
 purged = m.purge_archived(older_than=timedelta(days=90))    # 2. drop old archived rows
 print(f"purged {purged} archived rows")
+result = m.vacuum()                                         # 3. reclaim file size
+print(f"reclaimed {result.bytes_reclaimed} bytes")
 m.close()                                                   # checkpoints the WAL
-# 3. reclaim file size:  sqlite3 /path/to/agent_memory/tulving.db "VACUUM;"
 ```
 
-`purge_archived` is reason-aware: it **refuses to delete summarization-source entries** unless you
-name that reason explicitly, so compressing sessions into summaries never silently loses the
-sources. `DECISION`/pinned entries are never eviction targets in the first place, so a purge of
-archived rows can't remove a live decision.
-
-> **v0.1 gap:** purge and vacuum are **SDK-only** — there is no MCP tool or `tulving-mcp` flag for
-> them yet, so housekeeping means a short Python script or a scheduled job as above. A maintenance
-> CLI (`tulving-mcp --inspect` / `--purge` / `--vacuum`) is planned for a later release; day to day,
-> a per-project store rarely needs any of this.
+Day to day, a per-project store rarely needs any of this.
 
 ---
 
